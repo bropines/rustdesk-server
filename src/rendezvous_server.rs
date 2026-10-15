@@ -1496,10 +1496,16 @@ impl RendezvousServer {
             }));
             let mut reg_id: Option<String> = None;
             let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
+            // Idle deadline is created once and only pushed forward when a frame
+            // arrives (a per-iteration timeout would be reset by every keepalive
+            // tick and never fire).
+            let idle = tokio::time::sleep(Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
+            tokio::pin!(idle);
             loop {
                 tokio::select! {
-                    res = timeout(TCP_IDLE_TIMEOUT_MS, b.next()) => {
-                        let Ok(Some(Ok(msg))) = res else { break };
+                    res = b.next() => {
+                        let Some(Ok(msg)) = res else { break };
+                        idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
                         let tungstenite::Message::Binary(bytes) = msg else { continue };
                         if self.on_stream_frame(&bytes, &mut reg_id).await {
                             continue; // keepalive echo
@@ -1508,6 +1514,7 @@ impl RendezvousServer {
                             break;
                         }
                     }
+                    _ = &mut idle => break,
                     _ = keepalive.tick() => {
                         if reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
                             self.send_keepalive(&mut sink, addr, ws).await;
@@ -1527,10 +1534,13 @@ impl RendezvousServer {
             }
             let mut reg_id: Option<String> = None;
             let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
+            let idle = tokio::time::sleep(Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
+            tokio::pin!(idle);
             loop {
                 tokio::select! {
-                    res = timeout(TCP_IDLE_TIMEOUT_MS, b.next()) => {
-                        let Ok(Some(Ok(mut bytes))) = res else { break };
+                    res = b.next() => {
+                        let Some(Ok(mut bytes)) = res else { break };
+                        idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
                         // log::debug!("receive tcp data from {:?} {:?}", addr, bytes);
                         if let Some(Sink::Tss(s)) = sink.as_mut() {
                             if let Some(key) = s.encrypt.as_mut() {
@@ -1547,6 +1557,7 @@ impl RendezvousServer {
                             break;
                         }
                     }
+                    _ = &mut idle => break,
                     _ = keepalive.tick() => {
                         if reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
                             self.send_keepalive(&mut sink, addr, ws).await;
