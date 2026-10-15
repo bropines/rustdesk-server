@@ -76,6 +76,25 @@ enum Sink {
 }
 
 impl Sink {
+    /// Sends an already-serialized frame (encrypted when the stream is). An
+    /// empty frame is the rendezvous keepalive: TCP/WebSocket clients echo it.
+    async fn send_raw(&mut self, mut bytes: Vec<u8>) {
+        match self {
+            Sink::Wss(s) => {
+                if let Some(key) = s.encrypt.as_mut() {
+                    bytes = key.enc(&bytes);
+                }
+                allow_err!(s.sink.send(tungstenite::Message::Binary(bytes)).await)
+            }
+            Sink::Tss(s) => {
+                if let Some(key) = s.encrypt.as_mut() {
+                    bytes = key.enc(&bytes);
+                }
+                allow_err!(s.sink.send(Bytes::from(bytes)).await)
+            }
+        }
+    }
+
     async fn send(&mut self, msg: &RendezvousMessage) {
         if let Ok(mut bytes) = msg.write_to_bytes() {
             match self {
@@ -104,6 +123,9 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
+// Opt-in keepalive for TCP/WebSocket rendezvous clients (see TCP_KEEPALIVE_MS).
+// Off by default: behaviour then matches upstream hbbs.
+static TCP_KEEPALIVE: AtomicBool = AtomicBool::new(false);
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -113,6 +135,13 @@ struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: Strin
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 const PUNCH_REQ_MAX: usize = 10_000;
+// Keepalive for long-lived TCP/WebSocket rendezvous connections. Must stay
+// below REG_TIMEOUT (30 s) so registered peers keep showing online, and well
+// below the client's own timeout (keep_alive * 1.5 = 90 s by default).
+const TCP_KEEPALIVE_MS: u64 = 12_000;
+// Close a TCP/WebSocket rendezvous connection after this much silence
+// (registered clients echo every keepalive, so they never hit it).
+const TCP_IDLE_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Clone)]
 struct Inner {
@@ -232,6 +261,17 @@ impl RendezvousServer {
             MUST_LOGIN.store(true, Ordering::SeqCst);
         }
 
+        let tcp_keepalive = get_arg("tcp-keepalive");
+        if tcp_keepalive.to_uppercase() == "Y"
+            || (tcp_keepalive.is_empty()
+                && std::env::var("TCP_KEEPALIVE").unwrap_or_default().to_uppercase() == "Y")
+        {
+            TCP_KEEPALIVE.store(true, Ordering::SeqCst);
+        }
+        log::info!(
+            "TCP_KEEPALIVE={}",
+            if TCP_KEEPALIVE.load(Ordering::SeqCst) { "Y" } else { "N" }
+        );
         log::info!(
             "MUST_LOGIN={}",
             if MUST_LOGIN.load(Ordering::SeqCst) {
@@ -1088,10 +1128,31 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
-            if let Some(s) = sink.as_mut() {
-                s.send(&msg).await;
+            // Keep the WebSocket sink registered: removing it here left the peer
+            // unreachable (no further punch requests, no keepalives) until it
+            // reconnected.
+            let mut map = self.ws_map.lock().await;
+            let key = try_into_v4(addr);
+            let sent = if TCP_KEEPALIVE.load(Ordering::SeqCst) {
+                match map.get_mut(&key) {
+                    Some(s) => {
+                        s.send(&msg).await;
+                        true
+                    }
+                    None => false,
+                }
             } else {
+                // upstream behaviour: the sink is consumed by the first request
+                match map.remove(&key) {
+                    Some(mut s) => {
+                        s.send(&msg).await;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            drop(map);
+            if !sent {
                 self.tx.send(Data::Msg(msg.into(), addr))?;
             }
         } else {
@@ -1172,7 +1233,7 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
@@ -1181,6 +1242,7 @@ impl RendezvousServer {
                     "always-use-relay(aur) [Y|N]",
                     "test-geo(tg) <ip1> <ip2>",
                     "must-login(ml) [Y|N]",
+                    "tcp-keepalive(tk) [Y|N]",
                 )
             }
             Some("relay-servers" | "rs") => {
@@ -1328,6 +1390,13 @@ impl RendezvousServer {
                     }
                 }
             }
+            Some("tcp-keepalive" | "tk") => {
+                if let Some(v) = fds.next() {
+                    TCP_KEEPALIVE.store(v.to_uppercase() == "Y", Ordering::SeqCst);
+                } else {
+                    let _ = writeln!(res, "TCP_KEEPALIVE: {:?}", TCP_KEEPALIVE.load(Ordering::SeqCst));
+                }
+            }
             Some("must-login" | "ml") => {
                 if let Some(rs) = fds.next() {
                     if rs.to_uppercase() == "Y" {
@@ -1425,10 +1494,24 @@ impl RendezvousServer {
                 sink: a,
                 encrypt: None,
             }));
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
+            let mut reg_id: Option<String> = None;
+            let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
+            loop {
+                tokio::select! {
+                    res = timeout(TCP_IDLE_TIMEOUT_MS, b.next()) => {
+                        let Ok(Some(Ok(msg))) = res else { break };
+                        let tungstenite::Message::Binary(bytes) = msg else { continue };
+                        if self.on_stream_frame(&bytes, &mut reg_id).await {
+                            continue; // keepalive echo
+                        }
+                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                            break;
+                        }
+                    }
+                    _ = keepalive.tick() => {
+                        if reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
+                            self.send_keepalive(&mut sink, addr, ws).await;
+                        }
                     }
                 }
             }
@@ -1442,18 +1525,33 @@ impl RendezvousServer {
             if !key.is_empty() {
                 self.key_exchange_phase1(addr, &mut sink).await;
             }
-            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
-                // log::debug!("receive tcp data from {:?} {:?}", addr, bytes);
-                if let Some(Sink::Tss(s)) = sink.as_mut() {
-                    if let Some(key) = s.encrypt.as_mut() {
-                        if let Err(err) = key.dec(&mut bytes) {
-                            log::error!("dec tcp data from {:?} err: {:?}", addr, err);
+            let mut reg_id: Option<String> = None;
+            let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
+            loop {
+                tokio::select! {
+                    res = timeout(TCP_IDLE_TIMEOUT_MS, b.next()) => {
+                        let Ok(Some(Ok(mut bytes))) = res else { break };
+                        // log::debug!("receive tcp data from {:?} {:?}", addr, bytes);
+                        if let Some(Sink::Tss(s)) = sink.as_mut() {
+                            if let Some(key) = s.encrypt.as_mut() {
+                                if let Err(err) = key.dec(&mut bytes) {
+                                    log::error!("dec tcp data from {:?} err: {:?}", addr, err);
+                                    break;
+                                }
+                            }
+                        }
+                        if self.on_stream_frame(&bytes, &mut reg_id).await {
+                            continue; // keepalive echo
+                        }
+                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                             break;
                         }
                     }
-                }
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                    break;
+                    _ = keepalive.tick() => {
+                        if reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
+                            self.send_keepalive(&mut sink, addr, ws).await;
+                        }
+                    }
                 }
             }
         }
@@ -1462,6 +1560,53 @@ impl RendezvousServer {
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    /// Bookkeeping for a frame received on a long-lived TCP/WebSocket
+    /// rendezvous connection. Clients in TCP/WebSocket mode register once
+    /// (RegisterPk / RegisterPeer) and then only echo the server's empty
+    /// keepalive frames, so every frame from a registered connection refreshes
+    /// the peer's registration time (otherwise it shows offline 30 s after
+    /// registering). Returns true for an empty (keepalive) frame, which needs no
+    /// further handling.
+    async fn on_stream_frame(&mut self, bytes: &[u8], reg_id: &mut Option<String>) -> bool {
+        if bytes.is_empty() {
+            self.touch_peer(reg_id.as_deref()).await;
+            return true;
+        }
+        if let Ok(msg) = RendezvousMessage::parse_from_bytes(bytes) {
+            match msg.union {
+                Some(rendezvous_message::Union::RegisterPk(rk)) if !rk.id.is_empty() => {
+                    *reg_id = Some(rk.id);
+                }
+                Some(rendezvous_message::Union::RegisterPeer(rp)) if !rp.id.is_empty() => {
+                    *reg_id = Some(rp.id);
+                }
+                _ => {}
+            }
+        }
+        self.touch_peer(reg_id.as_deref()).await;
+        false
+    }
+
+    async fn touch_peer(&self, id: Option<&str>) {
+        if let Some(id) = id {
+            if let Some(peer) = self.pm.get_in_memory(id).await {
+                peer.write().await.last_reg_time = Instant::now();
+            }
+        }
+    }
+
+    /// Sends the empty keepalive frame. WebSocket sinks are moved into
+    /// `ws_map` on registration, so look there when the local one is gone.
+    async fn send_keepalive(&self, sink: &mut Option<Sink>, addr: SocketAddr, ws: bool) {
+        if let Some(s) = sink.as_mut() {
+            s.send_raw(Vec::new()).await;
+        } else if ws {
+            if let Some(s) = self.ws_map.lock().await.get_mut(&try_into_v4(addr)) {
+                s.send_raw(Vec::new()).await;
+            }
+        }
     }
 
     #[inline]
