@@ -112,6 +112,7 @@ use tokio::sync::Mutex as TokioMutex; // differentiate if needed
 struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
 static PUNCH_REQS: Lazy<TokioMutex<Vec<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(Vec::new()));
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
+const PUNCH_REQ_MAX: usize = 10_000;
 
 #[derive(Clone)]
 struct Inner {
@@ -620,13 +621,21 @@ impl RendezvousServer {
                     }
                     log::trace!("KeyExchange their_pk: {:?}", hex::encode(&ex.keys[0]));
                     log::trace!("KeyExchange box: {:?}", hex::encode(&ex.keys[1]));
-                    let their_pk: [u8; 32] = ex.keys[0].to_vec().try_into().unwrap();
-                    let cryptobox: [u8; 48] = ex.keys[1].to_vec().try_into().unwrap();
-                    let symetric_key = get_symetric_key_from_msg(
+                    let (Ok(their_pk), Ok(cryptobox)) = (
+                        <[u8; 32]>::try_from(ex.keys[0].as_ref()),
+                        <[u8; 48]>::try_from(ex.keys[1].as_ref()),
+                    ) else {
+                        log::warn!("Handshake failed from {}: malformed key exchange", addr);
+                        return false;
+                    };
+                    let Some(symetric_key) = get_symetric_key_from_msg(
                         self.inner.secure_tcp_sk_b.0,
                         their_pk,
                         &cryptobox,
-                    );
+                    ) else {
+                        log::warn!("Handshake failed from {}: cannot open key exchange box", addr);
+                        return false;
+                    };
                     log::debug!("KeyExchange symetric key: {:?}", hex::encode(&symetric_key));
                     let key = secretbox::Key::from_slice(&symetric_key);
                     match key {
@@ -902,6 +911,7 @@ impl RendezvousServer {
         // if secret is not empty check token by jwt
         if MUST_LOGIN.load(Ordering::SeqCst) {
             if ph.token.is_empty() {
+                log::warn!("MUST_LOGIN rejected from {} for peer {} - no token", addr, ph.id);
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
                     other_failure: String::from("Connection failed, please login!"),
@@ -912,6 +922,7 @@ impl RendezvousServer {
                 let token = ph.token;
                 let token = jwt::verify_token(token.as_str());
                 if token.is_err() {
+                    log::warn!("MUST_LOGIN rejected from {} for peer {} - invalid token", addr, ph.id);
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_punch_hole_response(PunchHoleResponse {
                         //提示重新登录
@@ -955,7 +966,14 @@ impl RendezvousServer {
                         break;
                     }
                 }
-                if !dup { lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone }); }
+                if !dup {
+                    lock.push(PunchReqEntry { tm: Instant::now(), from_ip, to_ip, to_id: to_id_clone });
+                    // keep memory bounded: drop the oldest entries beyond the cap
+                    if lock.len() > PUNCH_REQ_MAX {
+                        let excess = lock.len() - PUNCH_REQ_MAX;
+                        lock.drain(..excess);
+                    }
+                }
             }
 
             let mut msg_out = RendezvousMessage::new();
@@ -1285,7 +1303,10 @@ impl RendezvousServer {
                     } else {
                         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
                     }
-                    self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
+                    // re-apply the current relay list (passing "Y"/"N" here used to wipe it)
+                    self.tx
+                        .send(Data::RelayServers0(self.relay_servers0.join(",")))
+                        .ok();
                 } else {
                     let _ = writeln!(
                         res,
@@ -1642,17 +1663,10 @@ fn get_symetric_key_from_msg(
     our_sk_b: [u8; 32],
     their_pk_b: [u8; 32],
     sealed_value: &[u8; 48],
-) -> [u8; 32] {
+) -> Option<[u8; 32]> {
     let their_pk_b = box_::PublicKey(their_pk_b);
     let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
     let sk = box_::SecretKey(our_sk_b);
-    let key = box_::open(sealed_value, &nonce, &their_pk_b, &sk);
-    match key {
-        Ok(key) => {
-            let mut key_array = [0u8; 32];
-            key_array.copy_from_slice(&key);
-            key_array
-        }
-        Err(e) => panic!("Error while opening the seal key{:?}", e),
-    }
+    let key = box_::open(sealed_value, &nonce, &their_pk_b, &sk).ok()?;
+    key.as_slice().try_into().ok()
 }
