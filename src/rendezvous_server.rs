@@ -812,7 +812,7 @@ impl RendezvousServer {
             }
         }
         if changed || ws {
-            // update peer info，解决tcp过程中不更新在线时间的问题
+            // Update peer info, so TCP/WebSocket clients keep their online time fresh.
             self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
         }
         Ok(register_pk_response::Result::OK)
@@ -965,7 +965,7 @@ impl RendezvousServer {
                     log::warn!("MUST_LOGIN rejected from {} for peer {} - invalid token", addr, ph.id);
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_punch_hole_response(PunchHoleResponse {
-                        //提示重新登录
+                        // Ask the user to sign in again.
                         other_failure: String::from("Token error, please log out and log back in!"),
                         ..Default::default()
                     });
