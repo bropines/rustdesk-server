@@ -891,7 +891,7 @@ impl RendezvousServer {
                         log::warn!("Handshake failed from {}: cannot open key exchange box", addr);
                         return false;
                     };
-                    log::debug!("KeyExchange symetric key: {:?}", hex::encode(&symetric_key));
+                    log::debug!("KeyExchange with {:?}: symmetric key derived", addr);
                     let key = secretbox::Key::from_slice(&symetric_key);
                     match key {
                         Some(key) => {
