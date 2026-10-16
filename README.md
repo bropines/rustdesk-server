@@ -18,6 +18,7 @@ Default branch: **`rdpanel`**. RD Panel's container image pins a commit of this 
 | No connection timeouts for clients signed in to an API server | always on | lejianwen |
 | WebSocket clients (client ≥ 1.4.1) | ports 21118/21119 | lejianwen |
 | Keepalive for TCP/WebSocket rendezvous clients | `TCP_KEEPALIVE=Y` (or `--tcp-keepalive Y`, admin command `tcp-keepalive Y\|N`) | this fork |
+| WebRTC signaling for RustDesk ≥ 1.5.0 (SDP offer/answer, trickle ICE) | `WEBRTC=Y` (or `--webrtc Y`, admin command `webrtc Y\|N`) | this fork |
 | Hardening: no secrets in logs, no panic on a bad `KeyExchange` | always on | this fork |
 
 Everything else behaves like upstream. Where this fork changes behaviour, the change is
@@ -31,6 +32,28 @@ show as offline between re-registrations, which happen about every 90 s. With
 `TCP_KEEPALIVE=Y`, hbbs sends an empty frame every 12 s to registered TCP/WS
 connections. Idle connections that never register are still closed after 30 s.
 WebSocket clients always connect through the relay; size the relay bandwidth for that.
+
+### `WEBRTC`
+
+RustDesk 1.5.0 can open a WebRTC (ICE + DTLS) transport next to the usual TCP/UDP punch
+and relay, when the client has `enable-webrtc` on. hbbs only carries the signaling; the
+media path is peer-to-peer or through the TURN servers in the clients' `ice-servers`
+option. Upstream hbbs drops the WebRTC fields, so clients fall back to the classic
+transports. With `WEBRTC=Y` this hbbs forwards:
+
+| from → to | message (field) |
+|---|---|
+| controller → controlled | `PunchHoleRequest.webrtc_sdp_offer` → `PunchHole.webrtc_sdp_offer` (plus `force_relay`, which sets the answer's ICE policy) |
+| controlled → controller | `PunchHoleSent.webrtc_sdp_answer` → `PunchHoleResponse.webrtc_sdp_answer`; `RelayResponse.webrtc_sdp_answer` (forwarded as upstream does) |
+| controlled → controller | `IceCandidate` with `socket_addr` (from `PunchHole`), sent over TCP; delivered on the controller's punch connection |
+| controller → controlled | `IceCandidate` with `id`, sent on the punch connection; delivered over the peer's WebSocket or UDP registration |
+
+Candidates are forwarded only along a route that hbbs created when it forwarded an
+offer, i.e. after the key, `MUST_LOGIN` and online checks; at most 256 per direction,
+for 60 s, and the controller's punch connection is kept for the trickle instead of being
+consumed by the response. Offers are dropped when `ALWAYS_USE_RELAY=Y`, because a
+WebRTC pair can be direct. With `WEBRTC` off nothing changes: the fields are dropped
+and an `IceCandidate` closes the connection, as upstream does.
 
 ## Usage
 

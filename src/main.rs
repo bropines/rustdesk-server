@@ -25,7 +25,8 @@ fn main() -> ResultType<()> {
         , --mask=[MASK] '[DEPRECATED] Determine if the connection comes from LAN, e.g. 192.168.0.0/16'
         -k, --key=[KEY] 'Only allow the client with the same key'
         , --must-login=[Y|N] 'Only allow the client with login'
-        , --tcp-keepalive=[Y|N] 'Send keepalives to TCP/WebSocket rendezvous clients so they stay online'",
+        , --tcp-keepalive=[Y|N] 'Send keepalives to TCP/WebSocket rendezvous clients so they stay online'
+        , --webrtc=[Y|N] 'Forward WebRTC signaling (SDP offer/answer, ICE candidates) between clients'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
