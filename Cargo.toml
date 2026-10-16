@@ -59,9 +59,13 @@ flate2 = "1.0"
 reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocking", "socks", "json", "native-tls", "gzip"], default-features=false }
 
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+# hbb_common pulls native-tls (openssl) on Linux; build OpenSSL from source so musl/cross
+# builds do not need a system libssl.
+openssl = { version = "0.10", features = ["vendored"] }
 reqwest = { git = "https://github.com/rustdesk-org/reqwest", features = ["blocking", "socks", "json", "rustls-tls", "rustls-tls-native-roots", "gzip"], default-features=false }
 
 [build-dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 hbb_common = { path = "libs/hbb_common" }
 
 [workspace]
