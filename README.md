@@ -2,8 +2,8 @@
 
 hbbs/hbbr for [RD Panel](https://github.com/bropines/rdpanel), an API server and admin
 panel for RustDesk. This fork is based on
-[rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server) **1.1.16** and
-includes the API-server patches from
+[rustdesk/rustdesk-server](https://github.com/rustdesk/rustdesk-server) **1.1.17**
+(upstream `master`) and includes the API-server patches from
 [lejianwen/rustdesk-server](https://github.com/lejianwen/rustdesk-server) (`forapi`).
 It is not an official RustDesk project.
 
@@ -18,7 +18,7 @@ Default branch: **`rdpanel`**. RD Panel's container image pins a commit of this 
 | No connection timeouts for clients signed in to an API server | always on | lejianwen |
 | WebSocket clients (client ≥ 1.4.1) | ports 21118/21119 | lejianwen |
 | Keepalive for TCP/WebSocket rendezvous clients | `TCP_KEEPALIVE=Y` (or `--tcp-keepalive Y`, admin command `tcp-keepalive Y\|N`) | this fork |
-| Hardening: no secrets in logs, no panic on a bad `KeyExchange`, bounded punch-request log | always on | this fork |
+| Hardening: no secrets in logs, no panic on a bad `KeyExchange` | always on | this fork |
 
 Everything else behaves like upstream. Where this fork changes behaviour, the change is
 opt-in and off by default.
@@ -42,7 +42,9 @@ docker pull ghcr.io/bropines/rdpanel:latest
 
 See the [RD Panel deployment guide](https://github.com/bropines/rdpanel/blob/main/docs/deploy.md).
 The binaries accept the same options as upstream; see the
-[RustDesk self-host docs](https://rustdesk.com/docs/en/self-host/).
+[RustDesk self-host docs](https://rustdesk.com/docs/en/self-host/) and upstream's
+[configuration & environment variables](docs/environment-variables.md) reference
+(bind address, `MAX_PUNCH_REQUESTS`, database and relay tuning).
 
 ## Building
 
@@ -56,9 +58,9 @@ Static musl builds for the image use `cross` (see the RD Panel `image` workflow)
 
 ## Branches
 
-- `rdpanel`: maintained branch (upstream 1.1.16 + lejianwen API patches + this fork's fixes).
-- `merge-upstream-1.1.16`: the branch the work was done on; kept because older RD Panel
-  builds reference its commits.
+- `rdpanel`: maintained branch (upstream master + lejianwen API patches + this fork's fixes).
+- `merge-upstream-1.1.16`: the branch the 1.1.16 work was done on; kept because older
+  RD Panel builds reference its commits.
 - `forapi`, `master`, `0.0.9`, `0.1.x`: inherited from lejianwen and upstream, not maintained.
 
 ## License
