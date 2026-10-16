@@ -55,6 +55,20 @@ consumed by the response. Offers are dropped when `ALWAYS_USE_RELAY=Y`, because 
 WebRTC pair can be direct. With `WEBRTC` off nothing changes: the fields are dropped
 and an `IceCandidate` closes the connection, as upstream does.
 
+Behind one public IP upstream sends the controlled peer `FetchLocalAddr`, which has no
+offer field. With `WEBRTC=Y`, a request that carries an offer gets a `PunchHole` with the
+offer instead; the client sends its TCP punch in a separate request without an offer,
+which still gets `FetchLocalAddr`, so the LAN path stays.
+
+With `RUST_LOG=info,hbbs=debug` hbbs logs each offer, answer and ICE candidate it
+forwards or drops (with the reason), and route creation and expiry. At `info` it logs one
+line per WebRTC session when it ends: offers forwarded, which message carried the answer,
+and candidates each way. Only sizes and counts are logged, never SDP, candidates or keys.
+No `WebRTC offer` line for a connection means the controller sent no offer: the client
+only offers with "Enable WebRTC" on, never through a SOCKS proxy, and not when the peer
+is set to "Always connect via relay" (`force-always-relay`) unless its `ice-servers`
+include a TURN server.
+
 ## Usage
 
 The easiest way is the RD Panel all-in-one image (hbbs + hbbr + panel):

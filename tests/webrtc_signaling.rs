@@ -507,3 +507,190 @@ async fn webrtc_respects_must_login() {
     };
     assert_eq!(ph.webrtc_sdp_offer, OFFER);
 }
+
+/// Waits until hbbs has logged a line containing every one of `parts`; returns the log.
+async fn wait_log(h: &Hbbs, parts: &[&str]) -> String {
+    let start = Instant::now();
+    loop {
+        let log = std::fs::read_to_string(h.dir.path().join("hbbs.log")).unwrap_or_default();
+        if log.lines().any(|l| parts.iter().all(|p| l.contains(p))) {
+            return log;
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(WAIT),
+            "hbbs never logged a line with {parts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn relay_response(socket_addr: Bytes, answer: &str) -> RendezvousMessage {
+    let mut rr = RelayResponse {
+        socket_addr,
+        uuid: "relay-uuid".to_owned(),
+        relay_server: "relay.example".to_owned(),
+        version: "1.5.0".to_owned(),
+        webrtc_sdp_answer: answer.to_owned(),
+        ..Default::default()
+    };
+    rr.set_id(B_ID.to_owned());
+    let mut msg = RendezvousMessage::new();
+    msg.set_relay_response(rr);
+    msg
+}
+
+// RustDesk 1.5.0's controlled side, reached over UDP, takes the relay branch of
+// `handle_punch_hole` when either NAT is symmetric or the relay is forced (`relay_v4`):
+// `create_relay` sends `RelayResponse` on a fresh TCP connection, key-exchanged only when
+// it carries an answer, and otherwise in the clear without reading the server's
+// KeyExchange (the 1 ms connection seen in production). Both must reach the controller's
+// punch connection, and the session must end with one INFO summary that has counts but no
+// SDP, candidates or session keys.
+#[tokio::test]
+async fn webrtc_relay_branch_like_rustdesk_150() {
+    let h = start_hbbs(port_for(4), &[("WEBRTC", "Y")]);
+    let mut b = register_udp_peer(&h).await;
+
+    // no answer: plain RelayResponse, no key exchange
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&punch_request(&h, "", "")).await.unwrap();
+    let Some(rendezvous_message::Union::PunchHole(ph)) =
+        udp_recv(&mut b, WAIT).await.and_then(|m| m.union)
+    else {
+        panic!("B got no PunchHole");
+    };
+    assert!(ph.webrtc_sdp_offer.is_empty());
+    let local: SocketAddr = format!("{B_IP}:0").parse().unwrap();
+    let mut b_plain = FramedStream::new(server(&h), Some(local), WAIT).await.unwrap();
+    b_plain
+        .send(&relay_response(ph.socket_addr.clone(), ""))
+        .await
+        .unwrap();
+    match tcp_recv(&mut a, WAIT).await.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::RelayResponse(r)) => {
+            assert_eq!(r.uuid, "relay-uuid");
+            assert!(r.webrtc_sdp_answer.is_empty());
+        }
+        other => panic!("A got no RelayResponse: {other:?}"),
+    }
+
+    // with an offer and an answer: the answer goes key-exchanged, the trickle follows
+    let mut a = tcp_secure(&h, A_IP).await;
+    let a_addr = a.local_addr();
+    a.send(&punch_request(&h, OFFER, "")).await.unwrap();
+    let Some(rendezvous_message::Union::PunchHole(ph)) =
+        udp_recv(&mut b, WAIT).await.and_then(|m| m.union)
+    else {
+        panic!("B got no PunchHole");
+    };
+    assert_eq!(ph.webrtc_sdp_offer, OFFER);
+    let mut b_ice = tcp_secure(&h, B_IP).await;
+    b_ice.send(&ice("", &ph.socket_addr, "b1")).await.unwrap();
+    expect_ice(tcp_recv(&mut a, WAIT).await, "b1");
+    let mut b_ans = tcp_secure(&h, B_IP).await;
+    b_ans
+        .send(&relay_response(ph.socket_addr.clone(), ANSWER))
+        .await
+        .unwrap();
+    match tcp_recv(&mut a, WAIT).await.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::RelayResponse(r)) => {
+            assert_eq!(r.webrtc_sdp_answer, ANSWER)
+        }
+        other => panic!("A got no RelayResponse: {other:?}"),
+    }
+    a.send(&ice(B_ID, &[], "a1")).await.unwrap();
+    expect_ice(udp_recv(&mut b, WAIT).await, "a1");
+    a.send(&ice("someoneelse", &[], "x")).await.unwrap();
+    a.send(&ice(B_ID, &[], "a2")).await.unwrap();
+    expect_ice(udp_recv(&mut b, WAIT).await, "a2");
+    drop(a);
+
+    let controller = format!("{a_addr:?}");
+    let log = wait_log(
+        &h,
+        &[
+            "WebRTC session",
+            &controller,
+            "controller connection closed",
+            "offers forwarded: 1",
+            "answer: RelayResponse",
+            "ICE to peer: 2 (dropped 1)",
+            "ICE to controller: 1 (dropped 0)",
+        ],
+    )
+    .await;
+    assert!(log.contains("forwarded in PunchHole"), "no offer line");
+    assert!(log.contains("sent via UDP"), "no offer delivery line");
+    assert!(log.contains("forwarded in RelayResponse"), "no answer line");
+    assert!(log.contains("WebRTC route") && log.contains("created"));
+    assert!(log.contains("dropped: not the peer this controller punched to"));
+    // sizes and counts only
+    for secret in [OFFER, ANSWER, SESSION] {
+        assert!(!log.contains(secret), "hbbs logged {secret}");
+    }
+}
+
+// Behind one public IP hbbs sends FetchLocalAddr, which has no offer field. With
+// WEBRTC=Y a request that carries an offer gets a PunchHole with it instead; the
+// controller's separate offer-less request (the one that owns its TCP punch) still gets
+// FetchLocalAddr, so the LAN path is kept. With WEBRTC off both get FetchLocalAddr.
+#[tokio::test]
+async fn webrtc_same_intranet() {
+    let h = start_hbbs(port_for(5), &[("WEBRTC", "Y")]);
+    let mut b = register_udp_peer(&h).await;
+
+    // the offer-less request keeps the classic LAN path
+    let mut a_tcp = tcp_secure(&h, B_IP).await;
+    a_tcp.send(&punch_request(&h, "", "")).await.unwrap();
+    match udp_recv(&mut b, WAIT).await.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::FetchLocalAddr(_)) => {}
+        other => panic!("B got no FetchLocalAddr: {other:?}"),
+    }
+
+    // the request with an offer: PunchHole, answer and trickle as across NATs
+    let mut a = tcp_secure(&h, B_IP).await;
+    a.send(&punch_request(&h, OFFER, "")).await.unwrap();
+    let Some(rendezvous_message::Union::PunchHole(ph)) =
+        udp_recv(&mut b, WAIT).await.and_then(|m| m.union)
+    else {
+        panic!("B got no PunchHole for the offer");
+    };
+    assert_eq!(ph.webrtc_sdp_offer, OFFER);
+    let mut b_ans = tcp_secure(&h, B_IP).await;
+    b_ans
+        .send(&punch_hole_sent(ph.socket_addr.clone(), ANSWER))
+        .await
+        .unwrap();
+    match tcp_recv(&mut a, WAIT).await.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::PunchHoleResponse(r)) => {
+            assert_eq!(r.webrtc_sdp_answer, ANSWER)
+        }
+        other => panic!("A got no PunchHoleResponse: {other:?}"),
+    }
+    let mut b_ice = tcp_secure(&h, B_IP).await;
+    b_ice.send(&ice("", &ph.socket_addr, "b1")).await.unwrap();
+    expect_ice(tcp_recv(&mut a, WAIT).await, "b1");
+    a.send(&ice(B_ID, &[], "a1")).await.unwrap();
+    expect_ice(udp_recv(&mut b, WAIT).await, "a1");
+    wait_log(&h, &["same intranet: instead of FetchLocalAddr"]).await;
+
+    // WEBRTC off: upstream behaviour, the offer is dropped and FetchLocalAddr goes out
+    admin(&h, "webrtc N");
+    let mut a2 = tcp_secure(&h, B_IP).await;
+    a2.send(&punch_request(&h, OFFER, "")).await.unwrap();
+    match udp_recv(&mut b, WAIT).await.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::FetchLocalAddr(_)) => {}
+        other => panic!("B got no FetchLocalAddr with WEBRTC off: {other:?}"),
+    }
+    wait_log(&h, &["WebRTC offer from", "dropped: WebRTC signaling is off"]).await;
+
+    // ALWAYS_USE_RELAY drops the offer, so FetchLocalAddr again
+    admin(&h, "webrtc Y");
+    admin(&h, "aur Y");
+    let mut a3 = tcp_secure(&h, B_IP).await;
+    a3.send(&punch_request(&h, OFFER, "")).await.unwrap();
+    match udp_recv(&mut b, WAIT).await.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::FetchLocalAddr(_)) => {}
+        other => panic!("B got no FetchLocalAddr with ALWAYS_USE_RELAY: {other:?}"),
+    }
+}

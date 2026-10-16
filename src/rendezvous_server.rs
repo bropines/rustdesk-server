@@ -158,16 +158,71 @@ struct WebrtcRoutes {
 
 struct WebrtcRoute {
     peer_id: String,
+    // first offer, for the session summary
+    started: Instant,
+    // last offer (punch retries refresh it); the TTL counts from here
     created: Instant,
+    offers: u32,
+    // the message that carried the answer to the controller, once one did
+    answer: Option<&'static str>,
     to_peer: u32,
     to_controller: u32,
+    dropped_to_peer: u32,
+    dropped_to_controller: u32,
+}
+
+/// Why a candidate was not forwarded along a route.
+#[derive(Debug, PartialEq)]
+enum IceDrop {
+    NoRoute,
+    OtherPeer,
+    Budget,
+}
+
+impl IceDrop {
+    fn as_str(&self) -> &'static str {
+        match self {
+            IceDrop::NoRoute => "no WebRTC route",
+            IceDrop::OtherPeer => "not the peer this controller punched to",
+            IceDrop::Budget => "per-route candidate budget used up",
+        }
+    }
+}
+
+impl WebrtcRoute {
+    /// One INFO line per WebRTC session: counts only, never SDP, candidates or keys.
+    fn log_end(&self, controller: &SocketAddr, reason: &str) {
+        log::info!(
+            "WebRTC session {:?} -> {}: {} after {} ms; offers forwarded: {}, answer: {}, ICE to peer: {} (dropped {}), ICE to controller: {} (dropped {})",
+            controller,
+            self.peer_id,
+            reason,
+            self.started.elapsed().as_millis(),
+            self.offers,
+            self.answer.unwrap_or("none"),
+            self.to_peer,
+            self.dropped_to_peer,
+            self.to_controller,
+            self.dropped_to_controller,
+        );
+    }
+
+    fn expired(&self) -> bool {
+        self.created.elapsed().as_millis() >= WEBRTC_ROUTE_TTL_MS
+    }
 }
 
 impl WebrtcRoutes {
     fn insert(&mut self, controller: SocketAddr, peer_id: String) {
         if self.routes.len() >= WEBRTC_MAX_ROUTES && !self.routes.contains_key(&controller) {
-            self.routes
-                .retain(|_, r| r.created.elapsed().as_millis() < WEBRTC_ROUTE_TTL_MS);
+            self.routes.retain(|addr, r| {
+                if r.expired() {
+                    r.log_end(addr, "expired");
+                    false
+                } else {
+                    true
+                }
+            });
         }
         if self.routes.len() >= WEBRTC_MAX_ROUTES && !self.routes.contains_key(&controller) {
             if let Some(oldest) = self
@@ -176,20 +231,48 @@ impl WebrtcRoutes {
                 .min_by_key(|(_, r)| r.created)
                 .map(|(k, _)| *k)
             {
-                self.routes.remove(&oldest);
+                if let Some(r) = self.routes.remove(&oldest) {
+                    r.log_end(&oldest, "evicted (route table full)");
+                }
             }
         }
         // A punch retry for the same peer keeps its counters; a new peer starts over.
         match self.routes.get_mut(&controller) {
-            Some(r) if r.peer_id == peer_id => r.created = Instant::now(),
-            _ => {
+            Some(r) if r.peer_id == peer_id && !r.expired() => {
+                r.created = Instant::now();
+                r.offers += 1;
+                log::debug!(
+                    "WebRTC route {:?} -> {} refreshed (offer #{})",
+                    controller,
+                    peer_id,
+                    r.offers
+                );
+            }
+            old => {
+                if let Some(r) = old {
+                    r.log_end(
+                        &controller,
+                        if r.expired() {
+                            "expired"
+                        } else {
+                            "replaced by an offer to another peer"
+                        },
+                    );
+                }
+                log::debug!("WebRTC route {:?} -> {} created", controller, peer_id);
+                let now = Instant::now();
                 self.routes.insert(
                     controller,
                     WebrtcRoute {
                         peer_id,
-                        created: Instant::now(),
+                        started: now,
+                        created: now,
+                        offers: 1,
+                        answer: None,
                         to_peer: 0,
                         to_controller: 0,
+                        dropped_to_peer: 0,
+                        dropped_to_controller: 0,
                     },
                 );
             }
@@ -197,12 +280,12 @@ impl WebrtcRoutes {
     }
 
     fn live(&mut self, controller: &SocketAddr) -> Option<&mut WebrtcRoute> {
-        let expired = self
-            .routes
-            .get(controller)
-            .map(|r| r.created.elapsed().as_millis() >= WEBRTC_ROUTE_TTL_MS)?;
+        let expired = self.routes.get(controller).map(|r| r.expired())?;
         if expired {
-            self.routes.remove(controller);
+            if let Some(r) = self.routes.remove(controller) {
+                log::debug!("WebRTC route {:?} -> {} expired", controller, r.peer_id);
+                r.log_end(controller, "expired");
+            }
             return None;
         }
         self.routes.get_mut(controller)
@@ -212,52 +295,96 @@ impl WebrtcRoutes {
         self.live(controller).is_some()
     }
 
-    /// A candidate from the controller to `peer_id`.
-    fn allow_to_peer(&mut self, controller: &SocketAddr, peer_id: &str) -> bool {
-        match self.live(controller) {
-            Some(r) if r.peer_id == peer_id && r.to_peer < WEBRTC_MAX_ICE_PER_ROUTE => {
-                r.to_peer += 1;
-                true
-            }
-            _ => false,
+    /// Records that `via` carried the answer to the controller.
+    fn answered(&mut self, controller: &SocketAddr, via: &'static str) {
+        if let Some(r) = self.live(controller) {
+            r.answer = Some(via);
         }
     }
 
-    /// A candidate from the controlled peer to the controller.
-    fn allow_to_controller(&mut self, controller: &SocketAddr) -> bool {
-        match self.live(controller) {
-            Some(r) if r.to_controller < WEBRTC_MAX_ICE_PER_ROUTE => {
-                r.to_controller += 1;
-                true
+    /// A candidate from the controller to `peer_id`; Ok carries its number on the route.
+    fn allow_to_peer(&mut self, controller: &SocketAddr, peer_id: &str) -> Result<u32, IceDrop> {
+        let r = self.live(controller).ok_or(IceDrop::NoRoute)?;
+        if r.peer_id != peer_id {
+            r.dropped_to_peer += 1;
+            return Err(IceDrop::OtherPeer);
+        }
+        if r.to_peer >= WEBRTC_MAX_ICE_PER_ROUTE {
+            r.dropped_to_peer += 1;
+            return Err(IceDrop::Budget);
+        }
+        r.to_peer += 1;
+        Ok(r.to_peer)
+    }
+
+    /// A candidate from the controlled peer to the controller; Ok carries the peer id and
+    /// the candidate's number on the route.
+    fn allow_to_controller(&mut self, controller: &SocketAddr) -> Result<(String, u32), IceDrop> {
+        let r = self.live(controller).ok_or(IceDrop::NoRoute)?;
+        if r.to_controller >= WEBRTC_MAX_ICE_PER_ROUTE {
+            r.dropped_to_controller += 1;
+            return Err(IceDrop::Budget);
+        }
+        r.to_controller += 1;
+        Ok((r.peer_id.clone(), r.to_controller))
+    }
+
+    /// Recounts a candidate that passed the route but could not be delivered as dropped.
+    fn undelivered(&mut self, controller: &SocketAddr, to_peer: bool) {
+        if let Some(r) = self.live(controller) {
+            if to_peer {
+                r.to_peer = r.to_peer.saturating_sub(1);
+                r.dropped_to_peer += 1;
+            } else {
+                r.to_controller = r.to_controller.saturating_sub(1);
+                r.dropped_to_controller += 1;
             }
-            _ => false,
         }
     }
 
+    /// The controller's connection closed: the session is over.
     fn remove(&mut self, controller: &SocketAddr) {
-        self.routes.remove(controller);
+        if let Some(r) = self.routes.remove(controller) {
+            r.log_end(
+                controller,
+                if r.expired() {
+                    "expired"
+                } else {
+                    "controller connection closed"
+                },
+            );
+        }
     }
 }
 
-/// The offer forwarded to the controlled peer: empty unless WebRTC signaling is on.
-/// `ALWAYS_USE_RELAY` drops it too, since a WebRTC pair can be direct.
-fn webrtc_offer_to_forward(offer: String) -> String {
-    if WEBRTC.load(Ordering::SeqCst)
-        && !ALWAYS_USE_RELAY.load(Ordering::SeqCst)
-        && offer.len() <= MAX_WEBRTC_SDP_LEN
-    {
-        offer
+/// The offer forwarded to the controlled peer, or why it is dropped. Dropped unless
+/// WebRTC signaling is on; `ALWAYS_USE_RELAY` drops it too, since a WebRTC pair can be
+/// direct.
+fn webrtc_offer_to_forward(offer: String) -> Result<String, &'static str> {
+    if offer.is_empty() {
+        Err("no offer")
+    } else if !WEBRTC.load(Ordering::SeqCst) {
+        Err("WebRTC signaling is off")
+    } else if ALWAYS_USE_RELAY.load(Ordering::SeqCst) {
+        Err("ALWAYS_USE_RELAY is on")
+    } else if offer.len() > MAX_WEBRTC_SDP_LEN {
+        Err("offer too large")
     } else {
-        String::new()
+        Ok(offer)
     }
 }
 
-/// The answer forwarded back to the controller: empty unless WebRTC signaling is on.
-fn webrtc_answer_to_forward(answer: String) -> String {
-    if WEBRTC.load(Ordering::SeqCst) && answer.len() <= MAX_WEBRTC_SDP_LEN {
-        answer
+/// The answer forwarded back to the controller, or why it is dropped (unless WebRTC
+/// signaling is on).
+fn webrtc_answer_to_forward(answer: String) -> Result<String, &'static str> {
+    if answer.is_empty() {
+        Err("no answer")
+    } else if !WEBRTC.load(Ordering::SeqCst) {
+        Err("WebRTC signaling is off")
+    } else if answer.len() > MAX_WEBRTC_SDP_LEN {
+        Err("answer too large")
     } else {
-        String::new()
+        Ok(answer)
     }
 }
 
@@ -701,6 +828,13 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
+                    if !phs.webrtc_sdp_answer.is_empty() {
+                        log::debug!(
+                            "WebRTC answer from {:?} ({} bytes) dropped: PunchHoleSent over UDP is unsupported",
+                            addr,
+                            phs.webrtc_sdp_answer.len()
+                        );
+                    }
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
                     // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
@@ -815,8 +949,14 @@ impl RendezvousServer {
                             rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
                         }
                     }
+                    // Passed through as upstream does, WEBRTC on or off; only logged here.
+                    let answer_len = rr.webrtc_sdp_answer.len();
                     msg_out.set_relay_response(rr);
-                    allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
+                    let delivered = self.send_to_tcp_sync(msg_out, addr_b).await;
+                    if answer_len > 0 {
+                        self.log_answer(addr_b, addr, "RelayResponse", answer_len, delivered)
+                            .await;
+                    }
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
@@ -923,6 +1063,13 @@ impl RendezvousServer {
                     if WEBRTC.load(Ordering::SeqCst) =>
                 {
                     return self.handle_ice_candidate(ice, addr).await;
+                }
+                Some(rendezvous_message::Union::IceCandidate(_)) => {
+                    // upstream behaviour: an unknown message closes the connection
+                    log::debug!(
+                        "ICE candidate from {:?} dropped: WebRTC signaling is off, closing",
+                        addr
+                    );
                 }
                 _ => {}
             }
@@ -1100,11 +1247,28 @@ impl RendezvousServer {
             &addr
         );
         let mut msg_out = RendezvousMessage::new();
+        let answer_len = phs.webrtc_sdp_answer.len();
+        let webrtc_sdp_answer = match webrtc_answer_to_forward(phs.webrtc_sdp_answer) {
+            Ok(answer) => answer,
+            Err(why) => {
+                if answer_len > 0 {
+                    log::debug!(
+                        "WebRTC answer from {:?} to {:?} ({} bytes) dropped: {}",
+                        addr,
+                        addr_a,
+                        answer_len,
+                        why
+                    );
+                }
+                String::new()
+            }
+        };
+        let forwards_answer = !webrtc_sdp_answer.is_empty();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
-            webrtc_sdp_answer: webrtc_answer_to_forward(phs.webrtc_sdp_answer),
+            webrtc_sdp_answer,
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -1114,9 +1278,47 @@ impl RendezvousServer {
         if let Some(socket) = socket {
             socket.send(&msg_out, addr_a).await?;
         } else {
-            self.send_to_tcp(msg_out, addr_a).await;
+            let delivered = self.send_to_tcp(msg_out, addr_a).await;
+            if forwards_answer {
+                self.log_answer(addr_a, addr, "PunchHoleResponse", answer_len, delivered)
+                    .await;
+            }
         }
         Ok(())
+    }
+
+    /// Debug line for an answer on its way to the controller; counts it on the route.
+    async fn log_answer(
+        &self,
+        controller: SocketAddr,
+        from: SocketAddr,
+        via: &'static str,
+        len: usize,
+        delivered: bool,
+    ) {
+        let mut routes = self.webrtc_routes.lock().await;
+        let routed = routes.contains(&try_into_v4(controller));
+        if delivered && routed {
+            routes.answered(&try_into_v4(controller), via);
+        }
+        drop(routes);
+        if delivered {
+            log::debug!(
+                "WebRTC answer from {:?} to {:?} ({} bytes) forwarded in {}{}",
+                from,
+                controller,
+                len,
+                via,
+                if routed { "" } else { " (no WebRTC route)" }
+            );
+        } else {
+            log::debug!(
+                "WebRTC answer from {:?} to {:?} ({} bytes) dropped: controller connection gone",
+                from,
+                controller,
+                len
+            );
+        }
     }
 
     #[inline]
@@ -1242,7 +1444,28 @@ impl RendezvousServer {
                     }
                 });
             let socket_addr = AddrMangle::encode(addr).into();
-            if same_intranet {
+            let offer_len = ph.webrtc_sdp_offer.len();
+            let webrtc_sdp_offer =
+                match webrtc_offer_to_forward(std::mem::take(&mut ph.webrtc_sdp_offer)) {
+                    Ok(offer) => offer,
+                    Err(why) => {
+                        if offer_len > 0 {
+                            log::debug!(
+                                "WebRTC offer from {:?} to {:?} ({} bytes) dropped: {}",
+                                addr,
+                                id,
+                                offer_len,
+                                why
+                            );
+                        }
+                        String::new()
+                    }
+                };
+            // FetchLocalAddr has no offer field, so behind one public IP a request with an
+            // offer gets a PunchHole instead. The controller sends its TCP punch, and with it
+            // the LAN (LocalAddr) path, in a separate offer-less request, which still gets
+            // FetchLocalAddr below.
+            if same_intranet && webrtc_sdp_offer.is_empty() {
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
                     id,
@@ -1261,9 +1484,18 @@ impl RendezvousServer {
                     peer_addr,
                     addr
                 );
-                let webrtc_sdp_offer =
-                    webrtc_offer_to_forward(std::mem::take(&mut ph.webrtc_sdp_offer));
                 if !webrtc_sdp_offer.is_empty() {
+                    log::debug!(
+                        "WebRTC offer from {:?} to {:?} ({} bytes) forwarded in PunchHole{}",
+                        addr,
+                        id,
+                        webrtc_sdp_offer.len(),
+                        if same_intranet {
+                            " (same intranet: instead of FetchLocalAddr)"
+                        } else {
+                            ""
+                        }
+                    );
                     self.webrtc_routes
                         .lock()
                         .await
@@ -1312,19 +1544,27 @@ impl RendezvousServer {
 
     /// A controller with a WebRTC route keeps its punch connection for trickle ICE,
     /// so its sink stays in `tcp_punch` after the response instead of being consumed.
-    /// Returns false when there is no such route (upstream behaviour applies).
-    async fn send_to_webrtc_controller(&self, msg: &RendezvousMessage, addr: SocketAddr) -> bool {
+    /// None when there is no such route (upstream behaviour applies), else whether the
+    /// controller's connection was still there.
+    async fn send_to_webrtc_controller(
+        &self,
+        msg: &RendezvousMessage,
+        addr: SocketAddr,
+    ) -> Option<bool> {
         if !WEBRTC.load(Ordering::SeqCst) {
-            return false;
+            return None;
         }
         let key = try_into_v4(addr);
         if !self.webrtc_routes.lock().await.contains(&key) {
-            return false;
+            return None;
         }
-        if let Some(sink) = self.tcp_punch.lock().await.get_mut(&key) {
-            sink.send(msg).await;
+        match self.tcp_punch.lock().await.get_mut(&key) {
+            Some(sink) => {
+                sink.send(msg).await;
+                Some(true)
+            }
+            None => Some(false),
         }
-        true
     }
 
     /// Forwards a trickle ICE candidate along a WebRTC route. Returns whether the
@@ -1332,36 +1572,96 @@ impl RendezvousServer {
     /// one connection, the controller on its punch connection.
     async fn handle_ice_candidate(&mut self, ice: IceCandidate, addr: SocketAddr) -> bool {
         if !ice_candidate_is_valid(&ice) {
+            log::debug!(
+                "ICE candidate from {:?} dropped: invalid (candidate {} bytes, session key {} bytes), closing",
+                addr,
+                ice.candidate.len(),
+                ice.session_key.len()
+            );
             return false;
         }
         let mut msg_out = RendezvousMessage::new();
         if !ice.socket_addr.is_empty() {
             // controlled -> controller, addressed by PunchHole.socket_addr
             let controller = try_into_v4(AddrMangle::decode(&ice.socket_addr));
-            if !self.webrtc_routes.lock().await.allow_to_controller(&controller) {
-                log::debug!("dropped ICE candidate from {:?}: no WebRTC route", addr);
-                return true;
-            }
+            let (peer_id, n) = match self
+                .webrtc_routes
+                .lock()
+                .await
+                .allow_to_controller(&controller)
+            {
+                Ok(x) => x,
+                Err(why) => {
+                    log::debug!(
+                        "ICE candidate from {:?} to controller {:?} dropped: {}",
+                        addr,
+                        controller,
+                        why.as_str()
+                    );
+                    return true;
+                }
+            };
             msg_out.set_ice_candidate(IceCandidate {
                 session_key: ice.session_key,
                 candidate: ice.candidate,
                 ..Default::default()
             });
-            if let Some(sink) = self.tcp_punch.lock().await.get_mut(&controller) {
-                sink.send(&msg_out).await;
+            let delivered = match self.tcp_punch.lock().await.get_mut(&controller) {
+                Some(sink) => {
+                    sink.send(&msg_out).await;
+                    true
+                }
+                None => false,
+            };
+            if delivered {
+                log::debug!(
+                    "ICE candidate #{} {} -> {:?} forwarded (from {:?})",
+                    n,
+                    peer_id,
+                    controller,
+                    addr
+                );
+            } else {
+                self.webrtc_routes
+                    .lock()
+                    .await
+                    .undelivered(&controller, false);
+                log::debug!(
+                    "ICE candidate {} -> {:?} dropped: controller connection gone",
+                    peer_id,
+                    controller
+                );
             }
         } else if !ice.id.is_empty() {
             // controller -> controlled, addressed by peer id
-            if !self
+            let controller = try_into_v4(addr);
+            let n = match self
                 .webrtc_routes
                 .lock()
                 .await
-                .allow_to_peer(&try_into_v4(addr), &ice.id)
+                .allow_to_peer(&controller, &ice.id)
             {
-                log::debug!("dropped ICE candidate from {:?}: no WebRTC route", addr);
-                return true;
-            }
+                Ok(n) => n,
+                Err(why) => {
+                    log::debug!(
+                        "ICE candidate {:?} -> {} dropped: {}",
+                        addr,
+                        ice.id,
+                        why.as_str()
+                    );
+                    return true;
+                }
+            };
             let Some(peer) = self.pm.get_in_memory(&ice.id).await else {
+                self.webrtc_routes
+                    .lock()
+                    .await
+                    .undelivered(&controller, true);
+                log::debug!(
+                    "ICE candidate {:?} -> {} dropped: peer not online",
+                    addr,
+                    ice.id
+                );
                 return true;
             };
             let peer_addr = peer.read().await.socket_addr;
@@ -1381,19 +1681,34 @@ impl RendezvousServer {
             if !sent {
                 self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
             }
+            log::debug!(
+                "ICE candidate #{} {:?} -> {} forwarded via {}",
+                n,
+                addr,
+                ice.id,
+                if sent { "WebSocket" } else { "UDP" }
+            );
+        } else {
+            log::debug!(
+                "ICE candidate from {:?} dropped: neither peer id nor controller address",
+                addr
+            );
         }
         true
     }
 
+    /// Returns whether the destination connection was there to send to.
     #[inline]
-    async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        if self.send_to_webrtc_controller(&msg, addr).await {
-            return;
+    async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) -> bool {
+        if let Some(delivered) = self.send_to_webrtc_controller(&msg, addr).await {
+            return delivered;
         }
         let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        let delivered = tcp.is_some();
         tokio::spawn(async move {
             Self::send_to_sink(&mut tcp, msg).await;
         });
+        delivered
     }
 
     #[inline]
@@ -1403,18 +1718,16 @@ impl RendezvousServer {
         }
     }
 
+    /// Returns whether the destination connection was there to send to.
     #[inline]
-    async fn send_to_tcp_sync(
-        &mut self,
-        msg: RendezvousMessage,
-        addr: SocketAddr,
-    ) -> ResultType<()> {
-        if self.send_to_webrtc_controller(&msg, addr).await {
-            return Ok(());
+    async fn send_to_tcp_sync(&mut self, msg: RendezvousMessage, addr: SocketAddr) -> bool {
+        if let Some(delivered) = self.send_to_webrtc_controller(&msg, addr).await {
+            return delivered;
         }
         let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        let delivered = sink.is_some();
         Self::send_to_sink(&mut sink, msg).await;
-        Ok(())
+        delivered
     }
 
     #[inline]
@@ -1456,11 +1769,18 @@ impl RendezvousServer {
                 }
             };
             drop(map);
+            if webrtc_offer {
+                log::debug!(
+                    "WebRTC offer to {:?} sent via {}",
+                    addr,
+                    if sent { "WebSocket" } else { "UDP" }
+                );
+            }
             if !sent {
                 self.tx.send(Data::Msg(msg.into(), addr))?;
             }
         } else {
-            self.send_to_tcp_sync(msg, addr).await?;
+            self.send_to_tcp_sync(msg, addr).await;
         }
         Ok(())
     }
@@ -1705,6 +2025,10 @@ impl RendezvousServer {
             Some("webrtc" | "wr") => {
                 if let Some(v) = fds.next() {
                     WEBRTC.store(v.to_uppercase() == "Y", Ordering::SeqCst);
+                    log::info!(
+                        "WEBRTC={} (admin command)",
+                        if WEBRTC.load(Ordering::SeqCst) { "Y" } else { "N" }
+                    );
                 } else {
                     let _ = writeln!(res, "WEBRTC: {:?}", WEBRTC.load(Ordering::SeqCst));
                 }
@@ -2208,19 +2532,41 @@ mod tests {
     fn webrtc_routes_forward_only_along_a_route() {
         let mut routes = WebrtcRoutes::default();
         let a = sa("1.2.3.4:5000");
-        assert!(!routes.allow_to_peer(&a, "peer1"));
-        assert!(!routes.allow_to_controller(&a));
+        assert_eq!(routes.allow_to_peer(&a, "peer1"), Err(IceDrop::NoRoute));
+        assert_eq!(routes.allow_to_controller(&a), Err(IceDrop::NoRoute));
         routes.insert(a, "peer1".to_owned());
         assert!(routes.contains(&a));
-        assert!(routes.allow_to_peer(&a, "peer1"));
+        assert_eq!(routes.allow_to_peer(&a, "peer1"), Ok(1));
         // only the peer the controller punched to
-        assert!(!routes.allow_to_peer(&a, "peer2"));
-        assert!(routes.allow_to_controller(&a));
+        assert_eq!(routes.allow_to_peer(&a, "peer2"), Err(IceDrop::OtherPeer));
+        assert_eq!(routes.allow_to_controller(&a), Ok(("peer1".to_owned(), 1)));
         // another controller address has no route
-        assert!(!routes.allow_to_controller(&sa("1.2.3.4:5001")));
+        assert_eq!(
+            routes.allow_to_controller(&sa("1.2.3.4:5001")),
+            Err(IceDrop::NoRoute)
+        );
         routes.remove(&a);
         assert!(!routes.contains(&a));
-        assert!(!routes.allow_to_peer(&a, "peer1"));
+        assert_eq!(routes.allow_to_peer(&a, "peer1"), Err(IceDrop::NoRoute));
+    }
+
+    #[test]
+    fn webrtc_routes_count_for_the_session_summary() {
+        let mut routes = WebrtcRoutes::default();
+        let a = sa("1.2.3.4:5000");
+        routes.insert(a, "peer1".to_owned());
+        routes.insert(a, "peer1".to_owned());
+        assert!(routes.allow_to_peer(&a, "peer1").is_ok());
+        assert!(routes.allow_to_peer(&a, "peer1").is_ok());
+        assert!(routes.allow_to_peer(&a, "peer2").is_err());
+        routes.undelivered(&a, true);
+        assert!(routes.allow_to_controller(&a).is_ok());
+        routes.answered(&a, "PunchHoleResponse");
+        let r = routes.routes.get(&a).unwrap();
+        assert_eq!(r.offers, 2);
+        assert_eq!(r.answer, Some("PunchHoleResponse"));
+        assert_eq!((r.to_peer, r.dropped_to_peer), (1, 2));
+        assert_eq!((r.to_controller, r.dropped_to_controller), (1, 0));
     }
 
     #[test]
@@ -2229,17 +2575,17 @@ mod tests {
         let a = sa("1.2.3.4:5000");
         routes.insert(a, "peer1".to_owned());
         for _ in 0..WEBRTC_MAX_ICE_PER_ROUTE {
-            assert!(routes.allow_to_peer(&a, "peer1"));
-            assert!(routes.allow_to_controller(&a));
+            assert!(routes.allow_to_peer(&a, "peer1").is_ok());
+            assert!(routes.allow_to_controller(&a).is_ok());
         }
-        assert!(!routes.allow_to_peer(&a, "peer1"));
-        assert!(!routes.allow_to_controller(&a));
+        assert_eq!(routes.allow_to_peer(&a, "peer1"), Err(IceDrop::Budget));
+        assert_eq!(routes.allow_to_controller(&a), Err(IceDrop::Budget));
         // a punch retry for the same peer does not reset the budget
         routes.insert(a, "peer1".to_owned());
-        assert!(!routes.allow_to_peer(&a, "peer1"));
+        assert_eq!(routes.allow_to_peer(&a, "peer1"), Err(IceDrop::Budget));
         // a punch to another peer starts a new route
         routes.insert(a, "peer2".to_owned());
-        assert!(routes.allow_to_peer(&a, "peer2"));
+        assert!(routes.allow_to_peer(&a, "peer2").is_ok());
     }
 
     #[test]
@@ -2252,7 +2598,7 @@ mod tests {
                 .checked_sub(std::time::Duration::from_millis(WEBRTC_ROUTE_TTL_MS as u64 + 1))
                 .unwrap();
         }
-        assert!(!routes.allow_to_peer(&a, "peer1"));
+        assert_eq!(routes.allow_to_peer(&a, "peer1"), Err(IceDrop::NoRoute));
         assert!(!routes.contains(&a));
         for i in 0..(WEBRTC_MAX_ROUTES + 10) {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, (i / 250) as u8, (i % 250) as u8)), 1);
@@ -2265,16 +2611,17 @@ mod tests {
     fn webrtc_fields_forwarded_only_when_enabled() {
         let offer = "webrtc://offer".to_owned();
         WEBRTC.store(false, Ordering::SeqCst);
-        assert_eq!(webrtc_offer_to_forward(offer.clone()), "");
-        assert_eq!(webrtc_answer_to_forward(offer.clone()), "");
+        assert!(webrtc_offer_to_forward(offer.clone()).is_err());
+        assert!(webrtc_answer_to_forward(offer.clone()).is_err());
         WEBRTC.store(true, Ordering::SeqCst);
-        assert_eq!(webrtc_offer_to_forward(offer.clone()), offer);
-        assert_eq!(webrtc_answer_to_forward(offer.clone()), offer);
+        assert_eq!(webrtc_offer_to_forward(offer.clone()), Ok(offer.clone()));
+        assert_eq!(webrtc_answer_to_forward(offer.clone()), Ok(offer.clone()));
+        assert!(webrtc_offer_to_forward(String::new()).is_err());
         let huge = "x".repeat(MAX_WEBRTC_SDP_LEN + 1);
-        assert_eq!(webrtc_offer_to_forward(huge.clone()), "");
-        assert_eq!(webrtc_answer_to_forward(huge), "");
+        assert!(webrtc_offer_to_forward(huge.clone()).is_err());
+        assert!(webrtc_answer_to_forward(huge).is_err());
         ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
-        assert_eq!(webrtc_offer_to_forward(offer.clone()), "");
+        assert!(webrtc_offer_to_forward(offer.clone()).is_err());
         ALWAYS_USE_RELAY.store(false, Ordering::SeqCst);
         WEBRTC.store(false, Ordering::SeqCst);
     }
