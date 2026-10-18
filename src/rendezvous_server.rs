@@ -37,7 +37,7 @@ use hbb_common::{
     udp::FramedSocket,
     AddrMangle, ResultType,
 };
-use ipnetwork::Ipv4Network;
+use ipnetwork::{IpNetwork, Ipv4Network};
 
 use crate::jwt;
 use std::io::Error;
@@ -415,6 +415,50 @@ use tokio::sync::Mutex as TokioMutex; // differentiate if needed
 #[derive(Clone)]
 struct PunchReqEntry { tm: Instant, from_ip: String, to_ip: String, to_id: String }
 static PUNCH_REQS: Lazy<TokioMutex<VecDeque<PunchReqEntry>>> = Lazy::new(|| TokioMutex::new(VecDeque::new()));
+
+#[derive(Clone, Debug)]
+struct PrefixRule {
+    net: IpNetwork,
+    servers: Vec<String>,
+}
+
+static RELAY_MAP: Lazy<std::sync::RwLock<Vec<PrefixRule>>> = Lazy::new(|| std::sync::RwLock::new(Vec::new()));
+static ROTATION_GEO_RELAY: AtomicUsize = AtomicUsize::new(0);
+const RELAY_MAP_FILE: &str = "relay_map.txt";
+
+fn reload_relay_map() -> usize {
+    let mut rules = Vec::new();
+    if let Ok(file) = std::fs::File::open(RELAY_MAP_FILE) {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines().flatten() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            if let (Some(cidr_str), Some(servers_str)) = (parts.next(), parts.next()) {
+                if let Ok(net) = cidr_str.parse::<IpNetwork>() {
+                    let servers: Vec<String> = servers_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !servers.is_empty() {
+                        rules.push(PrefixRule { net, servers });
+                    }
+                }
+            }
+        }
+    }
+    rules.sort_by(|a, b| b.net.prefix().cmp(&a.net.prefix()));
+    let count = rules.len();
+    if let Ok(mut map) = RELAY_MAP.write() {
+        *map = rules;
+    }
+    log::info!("reload_relay_map: loaded {} prefix rules from {}", count, RELAY_MAP_FILE);
+    count
+}
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
 // Keepalive for long-lived TCP/WebSocket rendezvous connections. Must stay
 // below REG_TIMEOUT (30 s) so registered peers keep showing online, and well
@@ -494,6 +538,7 @@ impl RendezvousServer {
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
         log::info!("serial={}", serial);
+        reload_relay_map();
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
@@ -1839,10 +1884,42 @@ impl RendezvousServer {
         self.relay_servers = self.relay_servers0.clone();
     }
 
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
-        } else if self.relay_servers.len() == 1 {
+        }
+
+        // Try prefix routing (longest prefix match on pa first, then pb)
+        if let Ok(map) = RELAY_MAP.read() {
+            for target_ip in [pa, pb] {
+                let ip = match target_ip {
+                    IpAddr::V6(v6) => {
+                        if let Some(v4) = v6.to_ipv4() {
+                            IpAddr::V4(v4)
+                        } else {
+                            IpAddr::V6(v6)
+                        }
+                    }
+                    IpAddr::V4(v4) => IpAddr::V4(v4),
+                };
+                for rule in map.iter() {
+                    if rule.net.contains(ip) {
+                        let available: Vec<String> = rule
+                            .servers
+                            .iter()
+                            .filter(|s| self.relay_servers.contains(s))
+                            .cloned()
+                            .collect();
+                        if !available.is_empty() {
+                            let idx = ROTATION_GEO_RELAY.fetch_add(1, Ordering::SeqCst) % available.len();
+                            return available[idx].clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
         }
         let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
@@ -1878,6 +1955,10 @@ impl RendezvousServer {
                         let _ = writeln!(res, "{ip}");
                     }
                 }
+            }
+            Some("reload-geo" | "rg") => {
+                let n = reload_relay_map();
+                let _ = writeln!(res, "loaded {n} prefix rules");
             }
             Some("ip-blocker" | "ib") => {
                 let mut lock = IP_BLOCKER.lock().await;
@@ -2494,6 +2575,55 @@ fn get_symetric_key_from_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_rule_longest_match() {
+        let mut rules = vec![
+            PrefixRule {
+                net: "0.0.0.0/0".parse::<IpNetwork>().unwrap(),
+                servers: vec!["default-relay:21117".to_string()],
+            },
+            PrefixRule {
+                net: "185.0.0.0/8".parse::<IpNetwork>().unwrap(),
+                servers: vec!["eu-relay:21117".to_string()],
+            },
+            PrefixRule {
+                net: "185.162.0.0/16".parse::<IpNetwork>().unwrap(),
+                servers: vec!["ru-relay:21117".to_string()],
+            },
+        ];
+        rules.sort_by(|a, b| b.net.prefix().cmp(&a.net.prefix()));
+
+        let target_ip: IpAddr = "185.162.92.1".parse().unwrap();
+        let mut matched = None;
+        for rule in rules.iter() {
+            if rule.net.contains(target_ip) {
+                matched = Some(rule.servers[0].clone());
+                break;
+            }
+        }
+        assert_eq!(matched.unwrap(), "ru-relay:21117");
+
+        let target_ip2: IpAddr = "185.1.1.1".parse().unwrap();
+        let mut matched2 = None;
+        for rule in rules.iter() {
+            if rule.net.contains(target_ip2) {
+                matched2 = Some(rule.servers[0].clone());
+                break;
+            }
+        }
+        assert_eq!(matched2.unwrap(), "eu-relay:21117");
+
+        let target_ip3: IpAddr = "8.8.8.8".parse().unwrap();
+        let mut matched3 = None;
+        for rule in rules.iter() {
+            if rule.net.contains(target_ip3) {
+                matched3 = Some(rule.servers[0].clone());
+                break;
+            }
+        }
+        assert_eq!(matched3.unwrap(), "default-relay:21117");
+    }
 
     #[hbb_common::tokio::test]
     async fn udp_listener_uses_bind_address() {

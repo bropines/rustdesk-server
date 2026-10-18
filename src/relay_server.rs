@@ -35,7 +35,14 @@ lazy_static::lazy_static! {
     static ref USAGE: RwLock<HashMap<String, Usage>> = Default::default();
     static ref BLACKLIST: RwLock<HashSet<String>> = Default::default();
     static ref BLOCKLIST: RwLock<HashSet<String>> = Default::default();
+    static ref START_TIME: std::time::Instant = std::time::Instant::now();
 }
+
+static BYTES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RELAYS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AUTH_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BLOCKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DOWNGRADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static DOWNGRADE_THRESHOLD_100: AtomicUsize = AtomicUsize::new(66); // 0.66
 static DOWNGRADE_START_CHECK: AtomicUsize = AtomicUsize::new(1_800_000); // in ms
@@ -167,7 +174,7 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
     match fds.next() {
         Some("h") => {
             res = format!(
-                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                 "blacklist-add(ba) <ip>",
                 "blacklist-remove(br) <ip>",
                 "blacklist(b) <ip>",
@@ -179,7 +186,8 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 "limit-speed(ls) [value(Mb/s)]",
                 "total-bandwidth(tb) [value(Mb/s)]",
                 "single-bandwidth(sb) [value(Mb/s)]",
-                "usage(u)"
+                "usage(u)",
+                "stats"
             )
         }
         Some("blacklist-add" | "ba") => {
@@ -328,6 +336,26 @@ async fn check_cmd(cmd: &str, limiter: Limiter) -> String {
                 );
             }
         }
+        Some("stats") => {
+            let relays_active = USAGE.read().await.len();
+            let waiting = PEERS.lock().await.len();
+            let uptime_s = START_TIME.elapsed().as_secs();
+            let bytes_total = BYTES_TOTAL.load(Ordering::Relaxed);
+            let relays_total = RELAYS_TOTAL.load(Ordering::Relaxed);
+            let auth_failed = AUTH_FAILED.load(Ordering::Relaxed);
+            let blocked = BLOCKED.load(Ordering::Relaxed);
+            let downgraded = DOWNGRADED.load(Ordering::Relaxed);
+            let version = env!("CARGO_PKG_VERSION");
+            let _ = writeln!(res, "bytes_total={bytes_total}");
+            let _ = writeln!(res, "relays_total={relays_total}");
+            let _ = writeln!(res, "relays_active={relays_active}");
+            let _ = writeln!(res, "waiting={waiting}");
+            let _ = writeln!(res, "auth_failed={auth_failed}");
+            let _ = writeln!(res, "blocked={blocked}");
+            let _ = writeln!(res, "downgraded={downgraded}");
+            let _ = writeln!(res, "uptime_s={uptime_s}");
+            let _ = writeln!(res, "version={version}");
+        }
         _ => {}
     }
     res
@@ -407,6 +435,7 @@ async fn handle_connection(
     }
     let ip = ip.to_string();
     if BLOCKLIST.read().await.get(&ip).is_some() {
+        BLOCKED.fetch_add(1, Ordering::Relaxed);
         log::info!("{} blocked", ip);
         return;
     }
@@ -464,12 +493,14 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !key.is_empty() && rf.licence_key != key {
+                    AUTH_FAILED.fetch_add(1, Ordering::Relaxed);
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
                     return;
                 }
                 if !rf.uuid.is_empty() {
                     let mut peer = PEERS.lock().await.remove(&rf.uuid);
                     if let Some(peer) = peer.as_mut() {
+                        RELAYS_TOTAL.fetch_add(1, Ordering::Relaxed);
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
@@ -533,6 +564,7 @@ async fn relay(
                     total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
+                    BYTES_TOTAL.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     if !bytes.is_empty() {
                         stream.send_raw(bytes.into()).await?;
                     }
@@ -552,6 +584,7 @@ async fn relay(
                     total_limiter.consume(nb).await;
                     total += nb;
                     total_s += nb;
+                    BYTES_TOTAL.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     if !bytes.is_empty() {
                         peer.send_raw(bytes.into()).await?;
                     }
@@ -569,6 +602,7 @@ async fn relay(
         let n = tm.elapsed().as_millis() as usize;
         if n >= 1_000 {
             if BLOCKLIST.read().await.get(&ip).is_some() {
+                BLOCKED.fetch_add(1, Ordering::Relaxed);
                 log::info!("{} blocked", ip);
                 break;
             }
@@ -589,6 +623,7 @@ async fn relay(
                 && total > elapsed * downgrade_threshold
             {
                 downgrade = true;
+                DOWNGRADED.fetch_add(1, Ordering::Relaxed);
                 log::info!(
                     "Downgrade {}, exceed downgrade threshold {}bit/ms in {}ms",
                     id,
