@@ -20,6 +20,7 @@ Default branch: **`rdpanel`**. RD Panel's container image pins a commit of this 
 | Keepalive for TCP/WebSocket rendezvous clients | `TCP_KEEPALIVE=Y` (or `--tcp-keepalive Y`, admin command `tcp-keepalive Y\|N`) | this fork |
 | WebRTC signaling for RustDesk ≥ 1.5.0 (SDP offer/answer, trickle ICE) | `WEBRTC=Y` (or `--webrtc Y`, admin command `webrtc Y\|N`) | this fork |
 | Forward `RequestRelay` to peers registered over WebSocket | `WS_PEERS=Y` (or `--ws-peers Y`, admin command `ws-peers Y\|N`) | this fork |
+| Prove the server key on WebSocket connections too (signed `KeyExchange`, as on TCP) | `WS_KEY_EXCHANGE=Y` (or `--ws-key-exchange Y`) | this fork |
 | Separate relays for WebSocket (browser) clients | `WS_RELAY_SERVERS=<host:port,...>` (or `--ws-relay-servers`) | this fork |
 | Relay selection by client IP prefix | a `relay_map.txt` file next to hbbs (admin command `reload-geo`) | this fork |
 | Real client IPs behind a reverse proxy on another host (WebSocket port) | `TRUSTED_PROXIES=<IPs/CIDRs>` (or `--trusted-proxies`) | this fork |
@@ -80,6 +81,16 @@ Peers that register over WebSocket (RustDesk clients with "Use WebSocket") get
 `PunchHole` on that connection. With `WS_PEERS=Y` a `RequestRelay` for such a peer (e.g.
 from RD Panel's web client) is sent there too; by default it goes over UDP to the
 peer's address, as upstream.
+
+### `WS_KEY_EXCHANGE`
+
+On TCP, hbbs starts every rendezvous connection with a `KeyExchange` whose key is
+signed with the server key, so clients can verify they talk to the server they were
+configured for. Upstream does not send it on WebSocket connections, so browser clients
+cannot check the key before connecting to a device. With `WS_KEY_EXCHANGE=Y` hbbs
+sends it on WebSocket connections too; a client may ignore it (the connection stays
+unencrypted, as before) or answer with its own `KeyExchange`, after which both
+directions are encrypted exactly as on TCP. Off by default.
 
 ### `WS_RELAY_SERVERS`
 

@@ -315,6 +315,11 @@ static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
 // Opt-in keepalive for TCP/WebSocket rendezvous clients (see TCP_KEEPALIVE_MS).
 // Off by default: behaviour then matches upstream hbbs.
 static TCP_KEEPALIVE: AtomicBool = AtomicBool::new(false);
+// Opt-in: also send the signed KeyExchange (phase 1) on WebSocket connections, so
+// browser clients can check the server key; a client answering with its own
+// KeyExchange gets an encrypted connection as over TCP. Off by default: upstream
+// sends it on TCP only.
+static WS_KEY_EXCHANGE: AtomicBool = AtomicBool::new(false);
 // Opt-in: forward RequestRelay to a peer registered over WebSocket on that connection.
 // Off by default: RequestRelay goes over UDP to the peer's address, as upstream.
 static WS_PEERS: AtomicBool = AtomicBool::new(false);
@@ -985,6 +990,13 @@ impl RendezvousServer {
         if get_arg("ws-peers").to_uppercase() == "Y" {
             WS_PEERS.store(true, Ordering::SeqCst);
         }
+        if get_arg("ws-key-exchange").to_uppercase() == "Y" {
+            WS_KEY_EXCHANGE.store(true, Ordering::SeqCst);
+        }
+        log::info!(
+            "WS_KEY_EXCHANGE={}",
+            if WS_KEY_EXCHANGE.load(Ordering::SeqCst) { "Y" } else { "N" }
+        );
         log::info!(
             "WS_PEERS={}",
             if WS_PEERS.load(Ordering::SeqCst) { "Y" } else { "N" }
@@ -2677,6 +2689,9 @@ impl RendezvousServer {
             let (a, mut b) = ws_stream.split();
             conn = StreamConn::new(Sink::ws(a, addr));
             sink = Some(conn.sink.clone());
+            if !key.is_empty() && WS_KEY_EXCHANGE.load(Ordering::SeqCst) {
+                self.key_exchange_phase1(addr, &mut sink).await;
+            }
             // ends the connection once its writer task stopped
             let writer = conn.sink.clone();
             let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
@@ -2691,6 +2706,14 @@ impl RendezvousServer {
                         let Some(Ok(msg)) = res else { break };
                         idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
                         let tungstenite::Message::Binary(bytes) = msg else { continue };
+                        // after a KeyExchange (WS_KEY_EXCHANGE) the client encrypts its frames
+                        let mut bytes = BytesMut::from(&bytes[..]);
+                        if let Some(key) = conn.rx_key.as_mut() {
+                            if let Err(err) = key.dec(&mut bytes) {
+                                log::error!("dec ws data from {:?} err: {:?}", addr, err);
+                                break;
+                            }
+                        }
                         if self.on_stream_frame(&bytes, conn.reg_id.as_deref()).await {
                             continue; // keepalive echo
                         }
