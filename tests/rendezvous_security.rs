@@ -1,14 +1,15 @@
 //! End-to-end checks of hbbs' TCP/WebSocket rendezvous hardening against the real binary:
 //! RegisterPeer may only refresh an id its connection registered with RegisterPk, the
 //! WebSocket port trusts forwarding headers only from a trusted proxy and gives every
-//! connection its own address, RequestRelay gets the PunchHoleRequest checks,
-//! forwarding it over a WebSocket registration is opt-in (`WS_PEERS`), and
+//! connection its own address, RequestRelay gets the PunchHoleRequest checks and never
+//! carries the controller's `control_permissions` to the peer, forwarding it over a
+//! WebSocket registration is opt-in (`WS_PEERS`), and
 //! `WS_RELAY_SERVERS` gives WebSocket clients their own relays.
 
 use hbb_common::{
     bytes::Bytes,
     futures_util::{SinkExt, StreamExt},
-    protobuf::Message as _,
+    protobuf::{Message as _, MessageField},
     rendezvous_proto::*,
     sodiumoxide::crypto::{box_, secretbox, sign},
     tcp::FramedStream,
@@ -435,7 +436,7 @@ async fn ws_clients_behind_one_proxy_get_their_own_address() {
 }
 
 // RequestRelay gets the PunchHoleRequest checks (MUST_LOGIN, licence key, size) and the
-// forwarded request carries neither the controller's token nor the key.
+// forwarded request carries neither the controller's token, the key nor permissions.
 #[tokio::test]
 async fn request_relay_is_checked_like_punch_hole_request() {
     let h = start_hbbs(port_for(2), &[("MUST_LOGIN", "Y")]);
@@ -456,6 +457,25 @@ async fn request_relay_is_checked_like_punch_hole_request() {
         hbb_common::try_into_v4(AddrMangle::decode(&rr.socket_addr)),
         a_addr
     );
+
+    // control_permissions/controlled_context are the rendezvous server's to set (RustDesk
+    // clients apply them over the owner's settings): the controller's never reach B
+    let mut a = tcp_secure(&h, A_IP).await;
+    let mut msg = relay_request(B_ID, &h.licence, "token");
+    if let Some(rendezvous_message::Union::RequestRelay(rr)) = msg.union.as_mut() {
+        rr.control_permissions = MessageField::some(ControlPermissions {
+            permissions: u64::MAX,
+            ..Default::default()
+        });
+        rr.controlled_context = MessageField::some(ControlledContext {
+            conn_audit_ref: "forged".to_owned(),
+            ..Default::default()
+        });
+    }
+    a.send(&msg).await.unwrap();
+    let rr = expect_forwarded_relay(udp_recv(&mut b, WAIT).await);
+    assert!(rr.control_permissions.is_none(), "the controller's permissions were forwarded");
+    assert!(rr.controlled_context.is_none(), "the controller's context was forwarded");
 
     // a wrong key is refused
     let mut x = tcp_secure(&h, X_IP).await;

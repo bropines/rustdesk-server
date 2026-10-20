@@ -684,6 +684,21 @@ fn check_relay_request(rf: &RequestRelay, addr: SocketAddr, key: &str) -> Result
     Ok(())
 }
 
+/// Clears what a client's RequestRelay must not carry to the controlled peer: the
+/// controller's token (its login) and the licence key, which the peer does not use, and
+/// `control_permissions` / `controlled_context`, which only the rendezvous server may
+/// set. RustDesk clients apply `ControlPermissions` from the rendezvous server over the
+/// device owner's local settings (a permission set to "enable" is granted), so a
+/// controller that sent its own could grant itself access; upstream forwards both as
+/// sent. hbbs builds PunchHole/FetchLocalAddr itself, so those never carry the
+/// controller's.
+fn strip_controller_fields(rf: &mut RequestRelay) {
+    rf.token.clear();
+    rf.licence_key.clear();
+    rf.control_permissions = MessageField::none();
+    rf.controlled_context = MessageField::none();
+}
+
 /// The relay for a WebSocket client from `list` (WS_RELAY_SERVERS): `requested` when it
 /// is in the list, else the next one in rotation. None when the list is empty, i.e. the
 /// normal relay choice applies.
@@ -1343,10 +1358,7 @@ impl RendezvousServer {
                         if elapsed < REG_TIMEOUT {
                             let mut msg_out = RendezvousMessage::new();
                             rf.socket_addr = AddrMangle::encode(addr).into();
-                            // The controlled peer uses neither; the token is the
-                            // controller's login.
-                            rf.token.clear();
-                            rf.licence_key.clear();
+                            strip_controller_fields(&mut rf);
                             // WebSocket (browser) controllers: the peer must use a relay
                             // they can reach, when WS_RELAY_SERVERS is set
                             if ws {
@@ -3196,6 +3208,32 @@ mod tests {
         let other_peer = RequestRelay { id: "peer124".to_owned(), ..rf.clone() };
         assert_eq!(check_relay_request(&other_peer, addr, key), Err("Key mismatch"));
         assert_eq!(check_relay_request(&wrong_key, addr, key), Err("Key mismatch"));
+    }
+
+    #[test]
+    fn request_relay_never_forwards_controller_fields() {
+        let mut rf = RequestRelay {
+            licence_key: "server-key".to_owned(),
+            control_permissions: MessageField::some(ControlPermissions {
+                permissions: u64::MAX,
+                ..Default::default()
+            }),
+            controlled_context: MessageField::some(ControlledContext {
+                conn_audit_ref: "forged".to_owned(),
+                ..Default::default()
+            }),
+            ..relay_request()
+        };
+        strip_controller_fields(&mut rf);
+        assert!(rf.token.is_empty());
+        assert!(rf.licence_key.is_empty());
+        assert!(rf.control_permissions.is_none());
+        assert!(rf.controlled_context.is_none());
+        // the rest is forwarded as before
+        let expected = relay_request();
+        assert_eq!(rf.id, expected.id);
+        assert_eq!(rf.uuid, expected.uuid);
+        assert_eq!(rf.relay_server, expected.relay_server);
     }
 
     #[test]
