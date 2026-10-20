@@ -19,7 +19,10 @@ Default branch: **`rdpanel`**. RD Panel's container image pins a commit of this 
 | WebSocket clients (client ≥ 1.4.1) | ports 21118/21119 | lejianwen |
 | Keepalive for TCP/WebSocket rendezvous clients | `TCP_KEEPALIVE=Y` (or `--tcp-keepalive Y`, admin command `tcp-keepalive Y\|N`) | this fork |
 | WebRTC signaling for RustDesk ≥ 1.5.0 (SDP offer/answer, trickle ICE) | `WEBRTC=Y` (or `--webrtc Y`, admin command `webrtc Y\|N`) | this fork |
-| Hardening: no secrets in logs, no panic on a bad `KeyExchange` | always on | this fork |
+| Forward `RequestRelay` to peers registered over WebSocket | `WS_PEERS=Y` (or `--ws-peers Y`, admin command `ws-peers Y\|N`) | this fork |
+| Relay selection by client IP prefix | a `relay_map.txt` file next to hbbs (admin command `reload-geo`) | this fork |
+| Real client IPs behind a reverse proxy on another host (WebSocket port) | `TRUSTED_PROXIES=<IPs/CIDRs>` (or `--trusted-proxies`) | this fork |
+| Hardening: no secrets in logs, no panic on a bad `KeyExchange`; see [Security](#security) | always on | this fork |
 
 Everything else behaves like upstream. Where this fork changes behaviour, the change is
 opt-in and off by default.
@@ -68,6 +71,64 @@ No `WebRTC offer` line for a connection means the controller sent no offer: the 
 only offers with "Enable WebRTC" on, never through a SOCKS proxy, and not when the peer
 is set to "Always connect via relay" (`force-always-relay`) unless its `ice-servers`
 include a TURN server.
+
+### `WS_PEERS`
+
+Peers that register over WebSocket (RustDesk clients with "Use WebSocket") get
+`PunchHole` on that connection. With `WS_PEERS=Y` a `RequestRelay` for such a peer (e.g.
+from RD Panel's web client) is sent there too; by default it goes over UDP to the
+peer's address, as upstream.
+
+### `TRUSTED_PROXIES`
+
+The WebSocket port (21118) takes the client IP from `X-Real-IP` (else the rightmost
+`X-Forwarded-For` hop that is not a trusted proxy) only when the connection comes from
+loopback or from an address in `TRUSTED_PROXIES` (IPs or CIDRs, comma separated, e.g.
+`TRUSTED_PROXIES=172.16.0.0/12`). From anyone else the headers are ignored, as are
+loopback, unspecified and unparsable values. Set it when the reverse proxy in front of
+the WebSocket port runs on another host or container; otherwise all WebSocket clients
+show the proxy's IP (and share its IP-based limits). RD Panel's built-in `/ws/id`
+proxy connects over loopback and needs nothing.
+
+### `relay_map.txt` (relay by IP prefix)
+
+When a file `relay_map.txt` exists in hbbs' working directory (the data directory),
+hbbs picks the relay for a connection by IP prefix instead of round robin: the
+controller's IP is matched first, then the controlled peer's, longest prefix first.
+One rule per line, `#` starts a comment:
+
+```text
+# <cidr>          <relay>[,<relay>...]   (each written as in -r / RELAY)
+185.162.0.0/16    ru-relay.example.com:21117
+10.0.0.0/8        eu-relay.example.com,eu-relay2.example.com
+2001:db8::/32     eu-relay.example.com
+```
+
+Relays that are not in the relay list (or currently unreachable) are skipped; several
+relays in a rule are used round robin; with no match the usual round robin over all
+relays applies. The file is read at start and by the admin command `reload-geo` (`rg`);
+malformed lines are logged and skipped. `test-geo <controller-ip> <peer-ip>` (`tg`) shows the relay a pair gets.
+
+## Security
+
+Changes from upstream that are always on, because they close holes rather than add
+features:
+
+- TCP/WebSocket rendezvous: a `RegisterPeer` (which has no uuid) only refreshes the id
+  that connection registered with an accepted, uuid-checked `RegisterPk`; anything else
+  is answered with `request_pk` and the peer's address stays where it is. With
+  `TCP_KEEPALIVE`, only such a registration is kept online by its keepalives.
+- `RequestRelay` from a client gets the checks `PunchHoleRequest` has: `MUST_LOGIN`
+  (and the JWT check), and the licence key. RustDesk clients send the key in
+  `PunchHoleRequest` but not in the `RequestRelay` that follows a failed direct
+  connection, so a request without a key is accepted from an IP that passed the key
+  check for that peer in the last 120 s. Only online peers are asked, the controller's
+  token is not forwarded to the peer, and oversized requests are refused.
+- WebSocket client addresses: see `TRUSTED_PROXIES`. Every WebSocket connection keeps
+  its own port, so clients behind one IP no longer share an address.
+- Each TCP/WebSocket connection has a bounded send queue; a client that does not read
+  loses its own messages and is disconnected, and cannot stall delivery to others.
+- WebSocket message/frame size: 1 MiB on hbbs, 16 MiB on hbbr.
 
 ## Usage
 
