@@ -164,6 +164,102 @@ impl Sink {
     }
 }
 
+/// Reverse proxies whose X-Real-IP / X-Forwarded-For the WebSocket port honours:
+/// loopback always, plus the IPs/CIDRs in `TRUSTED_PROXIES` (comma or space separated).
+static TRUSTED_PROXIES: Lazy<Vec<IpNetwork>> =
+    Lazy::new(|| parse_trusted_proxies(&get_arg("trusted-proxies")));
+
+fn parse_trusted_proxies(list: &str) -> Vec<IpNetwork> {
+    let mut nets = Vec::new();
+    for item in list.split(|c: char| c == ',' || c.is_whitespace()) {
+        if item.is_empty() {
+            continue;
+        }
+        match item
+            .parse::<IpNetwork>()
+            .or_else(|_| item.parse::<IpAddr>().map(IpNetwork::from))
+        {
+            Ok(net) => nets.push(net),
+            Err(_) => log::warn!("TRUSTED_PROXIES: ignoring invalid entry {:?}", item),
+        }
+    }
+    nets
+}
+
+fn unmap_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        ip => ip,
+    }
+}
+
+fn is_trusted_proxy(ip: IpAddr, trusted: &[IpNetwork]) -> bool {
+    let ip = unmap_ip(ip);
+    ip.is_loopback() || trusted.iter().any(|net| net.contains(ip))
+}
+
+/// An IP from a forwarding header ("1.2.3.4", "::1", "[::1]:80", "1.2.3.4:80").
+fn parse_header_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim();
+    let ip = value
+        .parse::<IpAddr>()
+        .or_else(|_| value.parse::<SocketAddr>().map(|a| a.ip()))
+        .ok()?;
+    Some(unmap_ip(ip))
+}
+
+/// A forwarded client IP is used only when it is a plausible remote client.
+fn usable_client_ip(ip: IpAddr) -> Option<IpAddr> {
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// The client in an X-Forwarded-For chain: the rightmost hop that is not a trusted proxy
+/// (hops further left were written by the client itself and can be anything).
+fn forwarded_for_client(value: &str, trusted: &[IpNetwork]) -> Option<IpAddr> {
+    for hop in value.rsplit(',') {
+        let ip = parse_header_ip(hop)?;
+        if !is_trusted_proxy(ip, trusted) {
+            return usable_client_ip(ip);
+        }
+    }
+    None
+}
+
+/// The address hbbs uses for a WebSocket client.
+///
+/// X-Real-IP (else X-Forwarded-For) is honoured only when the TCP peer is a trusted
+/// reverse proxy; a missing, unparsable, loopback or unspecified value falls back to the
+/// TCP peer address. Upstream trusts the headers from anyone, which lets a client that
+/// reaches the port directly claim any IP (IP blocker, intranet detection, logs).
+///
+/// The port is always the TCP peer's (the proxy connection's ephemeral port), not 0 as
+/// upstream: the address keys the connection in `tcp_punch` and comes back in
+/// PunchHoleSent/RelayResponse, so two browsers behind one IP must not share it.
+fn ws_client_addr(
+    peer: SocketAddr,
+    real_ip: Option<&str>,
+    forwarded_for: Option<&str>,
+    trusted: &[IpNetwork],
+) -> SocketAddr {
+    let peer = try_into_v4(peer);
+    if !is_trusted_proxy(peer.ip(), trusted) {
+        return peer;
+    }
+    let ip = match (real_ip, forwarded_for) {
+        (Some(v), _) => parse_header_ip(v).and_then(usable_client_ip),
+        (None, Some(v)) => forwarded_for_client(v, trusted),
+        (None, None) => None,
+    };
+    match ip {
+        Some(ip) => try_into_v4(SocketAddr::new(ip, peer.port())),
+        None => peer,
+    }
+}
+
 /// A peer registered over WebSocket, keyed by its id in `ws_map`.
 struct WsPeer {
     // the connection that registered it; only that connection removes the entry
@@ -706,6 +802,14 @@ impl RendezvousServer {
         log::info!(
             "WEBRTC={}",
             if WEBRTC.load(Ordering::SeqCst) { "Y" } else { "N" }
+        );
+        log::info!(
+            "TRUSTED_PROXIES={:?} (plus loopback; WebSocket X-Real-IP/X-Forwarded-For)",
+            TRUSTED_PROXIES
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
         );
         log::info!(
             "MUST_LOGIN={}",
@@ -2286,28 +2390,21 @@ impl RendezvousServer {
         let mut conn;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+            let peer = addr;
+            addr = try_into_v4(peer);
             let callback = |req: &Request, response: Response| {
                 let headers = req.headers();
-                // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
-                // client IP is preserved when the WebSocket port runs behind a
-                // reverse proxy (WSS). They are NOT validated: anyone who can reach
-                // this port directly can spoof an arbitrary IP, bypassing IP-based
-                // rate limiting / blocking and corrupting logged IPs. Do not expose
-                // the WebSocket port directly to untrusted networks; only the
-                // reverse proxy, which overwrites these headers, should be able to
-                // connect to it.
+                // X-Real-IP / X-Forwarded-For keep the real client IP behind a reverse
+                // proxy (WSS), but only from a trusted proxy (loopback or
+                // TRUSTED_PROXIES): anyone else could claim any IP.
                 // https://github.com/rustdesk/rustdesk-server/issues/634
-                let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
-                if let Some(ip) = real_ip {
-                    if ip.contains('.') {
-                        addr = format!("{ip}:0").parse().unwrap_or(addr);
-                    } else {
-                        addr = format!("[{ip}]:0").parse().unwrap_or(addr);
-                    }
-                }
+                let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+                addr = ws_client_addr(
+                    peer,
+                    header("X-Real-IP"),
+                    header("X-Forwarded-For"),
+                    &TRUSTED_PROXIES,
+                );
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
@@ -2735,6 +2832,67 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn ws_client_addr_trusts_headers_only_from_trusted_proxies() {
+        let none: Vec<IpNetwork> = Vec::new();
+        let lo = sa("127.0.0.1:40000");
+        let mapped_lo = sa("[::ffff:127.0.0.1]:40000");
+        let remote = sa("203.0.113.7:40000");
+        // a direct client cannot pick its address
+        assert_eq!(ws_client_addr(remote, Some("8.8.8.8"), None, &none), remote);
+        assert_eq!(ws_client_addr(remote, None, Some("8.8.8.8"), &none), remote);
+        // a loopback proxy is trusted; the port stays the proxy connection's
+        assert_eq!(ws_client_addr(lo, Some("8.8.8.8"), None, &none), sa("8.8.8.8:40000"));
+        assert_eq!(
+            ws_client_addr(mapped_lo, Some(" 2001:db8::1 "), None, &none),
+            sa("[2001:db8::1]:40000")
+        );
+        assert_eq!(
+            ws_client_addr(lo, Some("::ffff:8.8.4.4"), None, &none),
+            sa("8.8.4.4:40000")
+        );
+        // no header: the TCP peer, normalized
+        assert_eq!(ws_client_addr(mapped_lo, None, None, &none), lo);
+        // loopback, unspecified and garbage are refused
+        for bad in ["127.0.0.1", "::1", "0.0.0.0", "::", "", "unknown", "1.2.3.4, 5.6.7.8"] {
+            assert_eq!(ws_client_addr(lo, Some(bad), None, &none), lo, "{bad:?}");
+        }
+        // X-Real-IP wins over X-Forwarded-For, even when it is unusable
+        assert_eq!(
+            ws_client_addr(lo, Some("9.9.9.9"), Some("8.8.8.8"), &none),
+            sa("9.9.9.9:40000")
+        );
+        assert_eq!(ws_client_addr(lo, Some("bogus"), Some("8.8.8.8"), &none), lo);
+        // X-Forwarded-For: the rightmost hop that is not a trusted proxy
+        assert_eq!(
+            ws_client_addr(lo, None, Some("6.6.6.6, 8.8.8.8"), &none),
+            sa("8.8.8.8:40000")
+        );
+        let proxies = parse_trusted_proxies("10.0.0.0/8, 192.168.1.1 bogus");
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(
+            ws_client_addr(lo, None, Some("6.6.6.6, 8.8.8.8, 10.1.2.3"), &proxies),
+            sa("8.8.8.8:40000")
+        );
+        assert_eq!(
+            ws_client_addr(lo, None, Some("8.8.8.8:1234, 127.0.0.1"), &proxies),
+            sa("8.8.8.8:40000")
+        );
+        assert_eq!(ws_client_addr(lo, None, Some("127.0.0.1, 10.0.0.1"), &proxies), lo);
+        assert_eq!(ws_client_addr(lo, None, Some("x, 8.8.8.8, junk"), &proxies), lo);
+        // a proxy from TRUSTED_PROXIES
+        let proxy = sa("192.168.1.1:50000");
+        assert_eq!(ws_client_addr(proxy, Some("8.8.8.8"), None, &none), proxy);
+        assert_eq!(
+            ws_client_addr(proxy, Some("8.8.8.8"), None, &proxies),
+            sa("8.8.8.8:50000")
+        );
+        assert_eq!(
+            ws_client_addr(sa("10.9.9.9:1"), None, Some("8.8.8.8"), &proxies),
+            sa("8.8.8.8:1")
+        );
     }
 
     #[hbb_common::tokio::test]

@@ -26,7 +26,8 @@ fn main() -> ResultType<()> {
         -k, --key=[KEY] 'Only allow the client with the same key'
         , --must-login=[Y|N] 'Only allow the client with login'
         , --tcp-keepalive=[Y|N] 'Send keepalives to TCP/WebSocket rendezvous clients so they stay online'
-        , --webrtc=[Y|N] 'Forward WebRTC signaling (SDP offer/answer, ICE candidates) between clients'",
+        , --webrtc=[Y|N] 'Forward WebRTC signaling (SDP offer/answer, ICE candidates) between clients'
+        , --trusted-proxies=[CIDRS] 'Reverse proxies (IPs/CIDRs, comma separated) whose X-Real-IP/X-Forwarded-For the WebSocket port honours, besides loopback'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;
