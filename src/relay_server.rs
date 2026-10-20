@@ -51,6 +51,7 @@ static TOTAL_BANDWIDTH: AtomicUsize = AtomicUsize::new(1024 * 1024 * 1024); // i
 static SINGLE_BANDWIDTH: AtomicUsize = AtomicUsize::new(128 * 1024 * 1024); // in bit/s
 const BLACKLIST_FILE: &str = "blacklist.txt";
 const BLOCKLIST_FILE: &str = "blocklist.txt";
+const WS_MAX_MESSAGE_SIZE: usize = 16 << 20;
 
 #[tokio::main(flavor = "multi_thread")]
 pub async fn start_with_bind(
@@ -479,7 +480,18 @@ async fn make_pair(
             }
             Ok(response)
         };
-        let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+        // Relayed WebSocket messages are client frames (video, clipboard, files). RustDesk
+        // clients send each message as one frame and accept frames up to 16 MiB, so that
+        // is the useful bound here too; it also caps reassembly of fragmented messages,
+        // which tungstenite otherwise allows up to 64 MiB per connection.
+        let config = tungstenite::protocol::WebSocketConfig {
+            max_message_size: Some(WS_MAX_MESSAGE_SIZE),
+            max_frame_size: Some(WS_MAX_MESSAGE_SIZE),
+            ..Default::default()
+        };
+        let ws_stream =
+            tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config))
+                .await?;
         make_pair_(ws_stream, addr, key, limiter).await;
     } else {
         make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;

@@ -260,6 +260,19 @@ fn ws_client_addr(
     }
 }
 
+// Rendezvous messages are small (an SDP offer is capped at 8 KiB); tungstenite's
+// defaults (64 MiB messages, 16 MiB frames) let one connection make hbbs buffer that
+// much. An oversized frame is refused on its header and closes the connection.
+const WS_MAX_MESSAGE_SIZE: usize = 1 << 20;
+
+fn ws_config() -> tungstenite::protocol::WebSocketConfig {
+    tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(WS_MAX_MESSAGE_SIZE),
+        max_frame_size: Some(WS_MAX_MESSAGE_SIZE),
+        ..Default::default()
+    }
+}
+
 /// A peer registered over WebSocket, keyed by its id in `ws_map`.
 struct WsPeer {
     // the connection that registered it; only that connection removes the entry
@@ -2568,7 +2581,9 @@ impl RendezvousServer {
                 );
                 Ok(response)
             };
-            let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            let ws_stream =
+                tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config()))
+                    .await?;
             let (a, mut b) = ws_stream.split();
             conn = StreamConn::new(Sink::ws(a, addr));
             sink = Some(conn.sink.clone());
