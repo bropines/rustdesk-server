@@ -1,8 +1,9 @@
 //! End-to-end checks of hbbs' TCP/WebSocket rendezvous hardening against the real binary:
 //! RegisterPeer may only refresh an id its connection registered with RegisterPk, the
 //! WebSocket port trusts forwarding headers only from a trusted proxy and gives every
-//! connection its own address, RequestRelay gets the PunchHoleRequest checks, and
-//! forwarding it over a WebSocket registration is opt-in (`WS_PEERS`).
+//! connection its own address, RequestRelay gets the PunchHoleRequest checks,
+//! forwarding it over a WebSocket registration is opt-in (`WS_PEERS`), and
+//! `WS_RELAY_SERVERS` gives WebSocket clients their own relays.
 
 use hbb_common::{
     bytes::Bytes,
@@ -68,6 +69,7 @@ fn start_hbbs(port: u16, env: &[(&str, &str)]) -> Hbbs {
         .env_remove("RUSTDESK_API_JWT_KEY")
         .env_remove("WS_PEERS")
         .env_remove("TRUSTED_PROXIES")
+        .env_remove("WS_RELAY_SERVERS")
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log));
     for (k, v) in env {
@@ -541,3 +543,50 @@ async fn keepalive_only_after_an_accepted_register_pk() {
     assert_eq!(other, None, "keepalive for a connection that only named an id");
 }
 
+// WS_RELAY_SERVERS (opt-in): WebSocket (browser) controllers get a relay from that list,
+// for punch requests and for the peer side of their RequestRelay; everyone else gets the
+// normal relay choice.
+#[tokio::test]
+async fn ws_relay_servers_only_for_websocket_clients() {
+    let ws_list = ["127.0.0.9:21117", "127.0.0.10:21117"];
+    let h = start_hbbs(
+        port_for(5),
+        &[
+            ("RELAY_SERVERS", "127.0.0.5:21117"),
+            ("WS_RELAY_SERVERS", "127.0.0.9:21117,127.0.0.10:21117"),
+        ],
+    );
+    let mut b = register_udp_peer(&h).await;
+
+    // a TCP controller: the relay servers
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&punch_request(&h, "")).await.unwrap();
+    assert_eq!(punch_hole(udp_recv(&mut b, WAIT).await).relay_server, "127.0.0.5:21117");
+    // a WebSocket controller: WS_RELAY_SERVERS, in rotation
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let mut w = ws_connect(&h, A_IP).await;
+        ws_send(&mut w, &punch_request(&h, "")).await;
+        let rs = punch_hole(udp_recv(&mut b, WAIT).await).relay_server;
+        assert!(ws_list.contains(&rs.as_str()), "{rs}");
+        seen.push(rs);
+    }
+    assert_ne!(seen[0], seen[1]);
+
+    // RequestRelay from a WebSocket controller: a relay outside the list is replaced,
+    // one in it is kept
+    let mut w = ws_connect(&h, A_IP).await;
+    ws_send(&mut w, &relay_request(B_ID, &h.licence, "")).await;
+    let rs = forwarded_relay(udp_recv(&mut b, WAIT).await).relay_server;
+    assert!(ws_list.contains(&rs.as_str()), "{rs}");
+    let mut w = ws_connect(&h, A_IP).await;
+    ws_send(&mut w, &relay_request_via(B_ID, &h.licence, "", "127.0.0.10:21117")).await;
+    assert_eq!(
+        forwarded_relay(udp_recv(&mut b, WAIT).await).relay_server,
+        "127.0.0.10:21117"
+    );
+    // from TCP: forwarded as requested, as upstream
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&relay_request(B_ID, &h.licence, "")).await.unwrap();
+    expect_forwarded_relay(udp_recv(&mut b, WAIT).await);
+}

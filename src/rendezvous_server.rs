@@ -317,6 +317,13 @@ static TCP_KEEPALIVE: AtomicBool = AtomicBool::new(false);
 // Opt-in: forward RequestRelay to a peer registered over WebSocket on that connection.
 // Off by default: RequestRelay goes over UDP to the peer's address, as upstream.
 static WS_PEERS: AtomicBool = AtomicBool::new(false);
+// Opt-in: the relays (host:port, comma separated) offered to WebSocket clients. Browsers
+// can only reach a relay that serves TLS WebSocket (usually the hbbr behind the panel's
+// reverse proxy), while the normal rotation may include remote relays. Empty (default):
+// WebSocket clients get the normal relay choice, as upstream.
+static WS_RELAY_SERVERS: Lazy<Vec<String>> =
+    Lazy::new(|| get_servers(&get_arg("ws-relay-servers"), "ws-relay-servers"));
+static ROTATION_WS_RELAY: AtomicUsize = AtomicUsize::new(0);
 // Bounds for a client's RequestRelay, which hbbs forwards to the peer (upstream forwards
 // any size). A uuid is 36 characters, a relay server a host:port, a token a JWT.
 const MAX_RELAY_UUID_LEN: usize = 64;
@@ -677,6 +684,20 @@ fn check_relay_request(rf: &RequestRelay, addr: SocketAddr, key: &str) -> Result
     Ok(())
 }
 
+/// The relay for a WebSocket client from `list` (WS_RELAY_SERVERS): `requested` when it
+/// is in the list, else the next one in rotation. None when the list is empty, i.e. the
+/// normal relay choice applies.
+fn ws_relay_server(list: &[String], requested: &str) -> Option<String> {
+    if list.is_empty() {
+        return None;
+    }
+    if !requested.is_empty() && list.iter().any(|s| s == requested) {
+        return Some(requested.to_owned());
+    }
+    let i = ROTATION_WS_RELAY.fetch_add(1, Ordering::Relaxed) % list.len();
+    Some(list[i].clone())
+}
+
 fn ice_candidate_is_valid(ice: &IceCandidate) -> bool {
     !ice.candidate.is_empty()
         && ice.candidate.len() <= MAX_ICE_CANDIDATE_LEN
@@ -952,6 +973,8 @@ impl RendezvousServer {
             "WS_PEERS={}",
             if WS_PEERS.load(Ordering::SeqCst) { "Y" } else { "N" }
         );
+        // parsed (and logged) now, not at the first WebSocket punch request
+        Lazy::force(&WS_RELAY_SERVERS);
         log::info!(
             "TRUSTED_PROXIES={:?} (plus loopback; WebSocket X-Real-IP/X-Forwarded-For)",
             TRUSTED_PROXIES
@@ -1324,6 +1347,15 @@ impl RendezvousServer {
                             // controller's login.
                             rf.token.clear();
                             rf.licence_key.clear();
+                            // WebSocket (browser) controllers: the peer must use a relay
+                            // they can reach, when WS_RELAY_SERVERS is set
+                            if ws {
+                                if let Some(rs) =
+                                    ws_relay_server(&WS_RELAY_SERVERS, &rf.relay_server)
+                                {
+                                    rf.relay_server = rs;
+                                }
+                            }
                             let id = rf.id.clone();
                             msg_out.set_request_relay(rf);
                             // Opt-in (WS_PEERS): to a peer registered over WebSocket on
@@ -1831,7 +1863,14 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
             let is_lan = self.is_lan(addr);
-            let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
+            // WebSocket (browser) controllers: only relays they can reach, when configured
+            let ws_relay = if ws {
+                ws_relay_server(&WS_RELAY_SERVERS, "")
+            } else {
+                None
+            };
+            let mut relay_server =
+                ws_relay.unwrap_or_else(|| self.get_relay_server(addr.ip(), peer_addr.ip()));
             if ALWAYS_USE_RELAY.load(Ordering::SeqCst) || (peer_is_lan ^ is_lan) {
                 if peer_is_lan {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
@@ -2961,6 +3000,26 @@ mod tests {
             }
         }
         assert_eq!(matched3.unwrap(), "default-relay:21117");
+    }
+
+    #[test]
+    fn ws_relay_servers_for_websocket_clients() {
+        // empty: the normal relay choice (upstream)
+        assert_eq!(ws_relay_server(&[], ""), None);
+        assert_eq!(ws_relay_server(&[], "relay.example.com"), None);
+        let list = vec!["wss-relay-a:21117".to_owned(), "wss-relay-b:21117".to_owned()];
+        // a requested relay is kept when it is in the list
+        assert_eq!(
+            ws_relay_server(&list, "wss-relay-b:21117").as_deref(),
+            Some("wss-relay-b:21117")
+        );
+        // otherwise (or none requested) the list rotates
+        let picks: std::collections::HashSet<String> = (0..4)
+            .map(|_| ws_relay_server(&list, "remote-relay:21117").unwrap())
+            .collect();
+        assert_eq!(picks.len(), 2);
+        assert!(picks.iter().all(|p| list.contains(p)));
+        assert!(list.contains(&ws_relay_server(&list, "").unwrap()));
     }
 
     #[test]

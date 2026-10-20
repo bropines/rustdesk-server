@@ -27,6 +27,7 @@ fn main() -> ResultType<()> {
         , --must-login=[Y|N] 'Only allow the client with login'
         , --tcp-keepalive=[Y|N] 'Send keepalives to TCP/WebSocket rendezvous clients so they stay online'
         , --webrtc=[Y|N] 'Forward WebRTC signaling (SDP offer/answer, ICE candidates) between clients'
+        , --ws-relay-servers=[HOSTS] 'Relays offered to WebSocket (browser) clients instead of the relay servers, separated by comma'
         , --ws-peers=[Y|N] 'Forward RequestRelay to peers registered over WebSocket (default: UDP only, as upstream)'
         , --trusted-proxies=[CIDRS] 'Reverse proxies (IPs/CIDRs, comma separated) whose X-Real-IP/X-Forwarded-For the WebSocket port honours, besides loopback'",
     );
