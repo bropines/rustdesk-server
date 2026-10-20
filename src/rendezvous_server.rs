@@ -968,12 +968,24 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                    if let Some(peer) = self.pm.get(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        let mut map = self.ws_map.lock().await;
+                        let key = try_into_v4(peer_addr);
+                        let sent = match map.get_mut(&key) {
+                            Some(s) => {
+                                s.send(&msg_out).await;
+                                true
+                            }
+                            None => false,
+                        };
+                        drop(map);
+                        if !sent {
+                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        }
                     }
                     return true;
                 }
