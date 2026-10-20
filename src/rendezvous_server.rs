@@ -688,28 +688,52 @@ static RELAY_MAP: Lazy<std::sync::RwLock<Vec<PrefixRule>>> = Lazy::new(|| std::s
 static ROTATION_GEO_RELAY: AtomicUsize = AtomicUsize::new(0);
 const RELAY_MAP_FILE: &str = "relay_map.txt";
 
+/// One `relay_map.txt` line: `<cidr> <relay>[,<relay>...]`. Ok(None) for a blank line or
+/// a comment, Err for a line that is not a rule.
+fn parse_relay_map_line(line: &str) -> Result<Option<PrefixRule>, ()> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    let mut parts = line.split_whitespace();
+    let (Some(cidr_str), Some(servers_str)) = (parts.next(), parts.next()) else {
+        return Err(());
+    };
+    let net = cidr_str.parse::<IpNetwork>().map_err(|_| ())?;
+    let servers: Vec<String> = servers_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if servers.is_empty() {
+        return Err(());
+    }
+    Ok(Some(PrefixRule { net, servers }))
+}
+
+/// Prefix routing is on when `relay_map.txt` exists in the working directory; it is read
+/// at start and by the `reload-geo` admin command. Malformed lines are logged here, once
+/// per load, and skipped.
 fn reload_relay_map() -> usize {
     let mut rules = Vec::new();
-    if let Ok(file) = std::fs::File::open(RELAY_MAP_FILE) {
+    let file = std::fs::File::open(RELAY_MAP_FILE);
+    if let Ok(file) = &file {
         use std::io::BufRead;
         let reader = std::io::BufReader::new(file);
-        for line in reader.lines().flatten() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut parts = line.split_whitespace();
-            if let (Some(cidr_str), Some(servers_str)) = (parts.next(), parts.next()) {
-                if let Ok(net) = cidr_str.parse::<IpNetwork>() {
-                    let servers: Vec<String> = servers_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if !servers.is_empty() {
-                        rules.push(PrefixRule { net, servers });
-                    }
-                }
+        for (n, line) in reader.lines().enumerate() {
+            let Ok(line) = line else {
+                log::warn!("{}: cannot read line {}, stopped", RELAY_MAP_FILE, n + 1);
+                break;
+            };
+            match parse_relay_map_line(&line) {
+                Ok(Some(rule)) => rules.push(rule),
+                Ok(None) => {}
+                Err(()) => log::warn!(
+                    "{}:{}: ignored, expected `<cidr> <relay>[,<relay>...]`: {:?}",
+                    RELAY_MAP_FILE,
+                    n + 1,
+                    line.trim()
+                ),
             }
         }
     }
@@ -718,7 +742,11 @@ fn reload_relay_map() -> usize {
     if let Ok(mut map) = RELAY_MAP.write() {
         *map = rules;
     }
-    log::info!("reload_relay_map: loaded {} prefix rules from {}", count, RELAY_MAP_FILE);
+    if file.is_ok() {
+        log::info!("reload_relay_map: loaded {} prefix rules from {}", count, RELAY_MAP_FILE);
+    } else {
+        log::info!("reload_relay_map: no {}, prefix routing off", RELAY_MAP_FILE);
+    }
     count
 }
 const PUNCH_REQ_DEDUPE_SEC: u64 = 60;
@@ -1310,7 +1338,8 @@ impl RendezvousServer {
                             // https://github.com/rustdesk/rustdesk-server/issues/24
                             rr.relay_server = self.inner.local_ip.clone();
                         } else if rr.relay_server == self.inner.local_ip {
-                            rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
+                            // controller (addr_b) first, as for PunchHole
+                            rr.relay_server = self.get_relay_server(addr_b.ip(), addr.ip());
                         }
                     }
                     // Passed through as upstream does, WEBRTC on or off; only logged here.
@@ -2213,6 +2242,7 @@ impl RendezvousServer {
         self.relay_servers = self.relay_servers0.clone();
     }
 
+    /// `pa` is the controller's IP, `pb` the controlled peer's.
     fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
@@ -2221,16 +2251,9 @@ impl RendezvousServer {
         // Try prefix routing (longest prefix match on pa first, then pb)
         if let Ok(map) = RELAY_MAP.read() {
             for target_ip in [pa, pb] {
-                let ip = match target_ip {
-                    IpAddr::V6(v6) => {
-                        if let Some(v4) = v6.to_ipv4() {
-                            IpAddr::V4(v4)
-                        } else {
-                            IpAddr::V6(v6)
-                        }
-                    }
-                    IpAddr::V4(v4) => IpAddr::V4(v4),
-                };
+                // only IPv4-mapped addresses are IPv4 (`to_ipv4` also turned
+                // IPv4-compatible ones like ::1 or ::a.b.c.d into IPv4)
+                let ip = unmap_ip(target_ip);
                 for rule in map.iter() {
                     if rule.net.contains(ip) {
                         let available: Vec<String> = rule
@@ -2923,6 +2946,32 @@ mod tests {
             }
         }
         assert_eq!(matched3.unwrap(), "default-relay:21117");
+    }
+
+    #[test]
+    fn relay_map_lines() {
+        let rule = parse_relay_map_line("  10.0.0.0/8  eu-relay:21117, ru-relay ")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rule.net, "10.0.0.0/8".parse::<IpNetwork>().unwrap());
+        assert_eq!(rule.servers, vec!["eu-relay:21117".to_owned()]);
+        let rule = parse_relay_map_line("2001:db8::/32 a,b").unwrap().unwrap();
+        assert_eq!(rule.servers, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(parse_relay_map_line("").unwrap().is_none());
+        assert!(parse_relay_map_line("  # comment").unwrap().is_none());
+        for bad in ["10.0.0.0/8", "10.0.0.0/33 relay", "relay 10.0.0.0/8", "10.0.0.0/8 ,,"] {
+            assert!(parse_relay_map_line(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_ipv4_mapped_addresses_are_ipv4() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(unmap_ip(ip("::ffff:185.162.92.1")), ip("185.162.92.1"));
+        assert_eq!(unmap_ip(ip("185.162.92.1")), ip("185.162.92.1"));
+        // IPv4-compatible (deprecated) and loopback stay IPv6
+        assert_eq!(unmap_ip(ip("::b9a2:5c01")), ip("::b9a2:5c01"));
+        assert_eq!(unmap_ip(ip("::1")), ip("::1"));
     }
 
     #[hbb_common::tokio::test]
