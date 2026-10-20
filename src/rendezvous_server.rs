@@ -1108,7 +1108,16 @@ impl RendezvousServer {
                     // B registered
                     if !rp.id.is_empty() && rp.id.len() <= MAX_PEER_ID_LEN {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
-                        let request_pk = self.update_addr(rp.id, addr).await;
+                        // Upstream hbbs ignores RegisterPeer over TCP/WebSocket. Here it
+                        // may only refresh an id this connection registered with an
+                        // accepted (uuid-checked) RegisterPk: RegisterPeer carries no
+                        // uuid, so anyone could otherwise move another peer's address to
+                        // their own connection. Others are asked for their key.
+                        let request_pk = if conn.reg_id.as_deref() == Some(rp.id.as_str()) {
+                            self.update_addr(rp.id, addr).await
+                        } else {
+                            true
+                        };
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_register_peer_response(RegisterPeerResponse {
                             request_pk,
@@ -1124,6 +1133,10 @@ impl RendezvousServer {
                             });
                             Self::send_to_sink(sink, msg_out).await;
                         }
+                        // Keep the connection: the client answers request_pk with a
+                        // RegisterPk on it, and a refreshed registration lives on it
+                        // (closing used to end the registration it had just refreshed).
+                        return true;
                     }
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
@@ -2413,7 +2426,6 @@ impl RendezvousServer {
             sink = Some(conn.sink.clone());
             // ends the connection once its writer task stopped
             let writer = conn.sink.clone();
-            let mut reg_id: Option<String> = None;
             let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
             // Idle deadline is created once and only pushed forward when a frame
             // arrives (a per-iteration timeout would be reset by every keepalive
@@ -2426,7 +2438,7 @@ impl RendezvousServer {
                         let Some(Ok(msg)) = res else { break };
                         idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
                         let tungstenite::Message::Binary(bytes) = msg else { continue };
-                        if self.on_stream_frame(&bytes, &mut reg_id).await {
+                        if self.on_stream_frame(&bytes, conn.reg_id.as_deref()).await {
                             continue; // keepalive echo
                         }
                         if !self.handle_tcp(&bytes, &mut sink, &mut conn, addr, key, ws).await {
@@ -2436,7 +2448,7 @@ impl RendezvousServer {
                     _ = writer.closed() => break,
                     _ = &mut idle => break,
                     _ = keepalive.tick() => {
-                        if reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
+                        if conn.reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
                             conn.sink.send_raw(Vec::new());
                         }
                     }
@@ -2451,7 +2463,6 @@ impl RendezvousServer {
             if !key.is_empty() {
                 self.key_exchange_phase1(addr, &mut sink).await;
             }
-            let mut reg_id: Option<String> = None;
             let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
             let idle = tokio::time::sleep(Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
             tokio::pin!(idle);
@@ -2469,7 +2480,7 @@ impl RendezvousServer {
                                 break;
                             }
                         }
-                        if self.on_stream_frame(&bytes, &mut reg_id).await {
+                        if self.on_stream_frame(&bytes, conn.reg_id.as_deref()).await {
                             continue; // keepalive echo
                         }
                         if !self.handle_tcp(&bytes, &mut sink, &mut conn, addr, key, ws).await {
@@ -2479,7 +2490,7 @@ impl RendezvousServer {
                     _ = writer.closed() => break,
                     _ = &mut idle => break,
                     _ = keepalive.tick() => {
-                        if reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
+                        if conn.reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
                             conn.sink.send_raw(Vec::new());
                         }
                     }
@@ -2500,29 +2511,17 @@ impl RendezvousServer {
 
     /// Bookkeeping for a frame received on a long-lived TCP/WebSocket
     /// rendezvous connection. Clients in TCP/WebSocket mode register once
-    /// (RegisterPk / RegisterPeer) and then only echo the server's empty
-    /// keepalive frames, so every frame from a registered connection refreshes
-    /// the peer's registration time (otherwise it shows offline 30 s after
-    /// registering). Returns true for an empty (keepalive) frame, which needs no
-    /// further handling.
-    async fn on_stream_frame(&mut self, bytes: &[u8], reg_id: &mut Option<String>) -> bool {
-        if bytes.is_empty() {
-            self.touch_peer(reg_id.as_deref()).await;
-            return true;
+    /// (RegisterPk) and then only echo the server's empty keepalive frames, so
+    /// with TCP_KEEPALIVE every frame from a registered connection refreshes the
+    /// peer's registration time (otherwise it shows offline 30 s after
+    /// registering). `reg_id` is the id this connection registered with an
+    /// accepted RegisterPk, never just one it named. Returns true for an empty
+    /// (keepalive) frame, which needs no further handling.
+    async fn on_stream_frame(&mut self, bytes: &[u8], reg_id: Option<&str>) -> bool {
+        if TCP_KEEPALIVE.load(Ordering::SeqCst) {
+            self.touch_peer(reg_id).await;
         }
-        if let Ok(msg) = RendezvousMessage::parse_from_bytes(bytes) {
-            match msg.union {
-                Some(rendezvous_message::Union::RegisterPk(rk)) if !rk.id.is_empty() => {
-                    *reg_id = Some(rk.id);
-                }
-                Some(rendezvous_message::Union::RegisterPeer(rp)) if !rp.id.is_empty() => {
-                    *reg_id = Some(rp.id);
-                }
-                _ => {}
-            }
-        }
-        self.touch_peer(reg_id.as_deref()).await;
-        false
+        bytes.is_empty()
     }
 
     async fn touch_peer(&self, id: Option<&str>) {
