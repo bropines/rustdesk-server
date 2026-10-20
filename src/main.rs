@@ -29,7 +29,11 @@ fn main() -> ResultType<()> {
         , --webrtc=[Y|N] 'Forward WebRTC signaling (SDP offer/answer, ICE candidates) between clients'
         , --ws-relay-servers=[HOSTS] 'Relays offered to WebSocket (browser) clients instead of the relay servers, separated by comma'
         , --ws-peers=[Y|N] 'Forward RequestRelay to peers registered over WebSocket (default: UDP only, as upstream)'
-        , --trusted-proxies=[CIDRS] 'Reverse proxies (IPs/CIDRs, comma separated) whose X-Real-IP/X-Forwarded-For the WebSocket port honours, besides loopback'",
+        , --trusted-proxies=[CIDRS] 'Reverse proxies (IPs/CIDRs, comma separated) whose X-Real-IP/X-Forwarded-For the WebSocket port honours, besides loopback'
+        , --authz-url=[URL] 'Ask this HTTP endpoint before forwarding each connection attempt to a peer (default: off, as upstream)'
+        , --authz-secret=[SECRET] 'Bearer secret for --authz-url (prefer AUTHZ_SECRET or --authz-secret-file)'
+        , --authz-secret-file=[FILE] 'File with the bearer secret for --authz-url (wins over --authz-secret)'
+        , --authz-fail-closed=[Y|N] 'Refuse connections while the --authz-url service fails (default: N, let them through)'",
     );
     init_args(&args, "hbbs", "RustDesk ID/Rendezvous Server");
     let port = get_arg_or("port", RENDEZVOUS_PORT.to_string()).parse::<i32>()?;

@@ -39,6 +39,7 @@ use hbb_common::{
 };
 use ipnetwork::{IpNetwork, Ipv4Network};
 
+use crate::authz;
 use crate::jwt;
 use std::io::Error;
 use std::{
@@ -691,7 +692,7 @@ fn check_relay_request(rf: &RequestRelay, addr: SocketAddr, key: &str) -> Result
 /// device owner's local settings (a permission set to "enable" is granted), so a
 /// controller that sent its own could grant itself access; upstream forwards both as
 /// sent. hbbs builds PunchHole/FetchLocalAddr itself, so those never carry the
-/// controller's.
+/// controller's. hbbs may set permissions afterwards (AUTHZ_URL).
 fn strip_controller_fields(rf: &mut RequestRelay) {
     rf.token.clear();
     rf.licence_key.clear();
@@ -990,6 +991,7 @@ impl RendezvousServer {
         );
         // parsed (and logged) now, not at the first WebSocket punch request
         Lazy::force(&WS_RELAY_SERVERS);
+        authz::init()?;
         log::info!(
             "TRUSTED_PROXIES={:?} (plus loopback; WebSocket X-Real-IP/X-Forwarded-For)",
             TRUSTED_PROXIES
@@ -1356,6 +1358,25 @@ impl RendezvousServer {
                             (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
                         };
                         if elapsed < REG_TIMEOUT {
+                            // Opt-in (AUTHZ_URL), as for PunchHoleRequest; no lock is
+                            // held across the call.
+                            let permissions = match authz::authorize(&authz::Attempt {
+                                target_id: &rf.id,
+                                token: &rf.token,
+                                conn_type: rf.conn_type.value(),
+                                controller_ip: unmap_ip(addr.ip()),
+                                kind: authz::Kind::RequestRelay,
+                            })
+                            .await
+                            {
+                                authz::Verdict::Allow(permissions) => permissions,
+                                authz::Verdict::Deny(reason) => {
+                                    let msg_out =
+                                        authz::refusal(authz::Kind::RequestRelay, reason);
+                                    self.send_to_tcp_sync(msg_out, addr).await;
+                                    return true;
+                                }
+                            };
                             let mut msg_out = RendezvousMessage::new();
                             rf.socket_addr = AddrMangle::encode(addr).into();
                             strip_controller_fields(&mut rf);
@@ -1370,6 +1391,7 @@ impl RendezvousServer {
                             }
                             let id = rf.id.clone();
                             msg_out.set_request_relay(rf);
+                            authz::set_permissions(&mut msg_out, permissions);
                             // Opt-in (WS_PEERS): to a peer registered over WebSocket on
                             // that connection. Upstream: UDP to the peer's address.
                             let sent = WS_PEERS.load(Ordering::SeqCst)
@@ -1861,6 +1883,22 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, None));
             }
+            // Opt-in (AUTHZ_URL): ask the authorization service before anything is
+            // recorded or forwarded. No lock is held across the call.
+            let permissions = match authz::authorize(&authz::Attempt {
+                target_id: &id,
+                token: &ph.token,
+                conn_type: ph.conn_type.value(),
+                controller_ip: unmap_ip(addr.ip()),
+                kind: authz::Kind::PunchHole,
+            })
+            .await
+            {
+                authz::Verdict::Allow(permissions) => permissions,
+                authz::Verdict::Deny(reason) => {
+                    return Ok((authz::refusal(authz::Kind::PunchHole, reason), None));
+                }
+            };
             
             // record punch hole request (from addr -> peer id/peer_addr)
             record_punch_req(
@@ -1967,6 +2005,7 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
+            authz::set_permissions(&mut msg_out, permissions);
             //
             Ok((msg_out, Some(peer_addr)))
         } else {
