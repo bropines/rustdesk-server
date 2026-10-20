@@ -3,8 +3,10 @@
 //! WebSocket port trusts forwarding headers only from a trusted proxy and gives every
 //! connection its own address, RequestRelay gets the PunchHoleRequest checks and never
 //! carries the controller's `control_permissions` to the peer, forwarding it over a
-//! WebSocket registration is opt-in (`WS_PEERS`), and
-//! `WS_RELAY_SERVERS` gives WebSocket clients their own relays.
+//! WebSocket registration is opt-in (`WS_PEERS`),
+//! `WS_RELAY_SERVERS` gives WebSocket clients their own relays, and the opt-in
+//! authorization hook (`AUTHZ_URL`) decides about attempts and sets the peer's
+//! permissions.
 
 use hbb_common::{
     bytes::Bytes,
@@ -21,6 +23,7 @@ use std::{
     io::{Read, Write},
     net::{IpAddr, SocketAddr},
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tokio_tungstenite::{
@@ -71,6 +74,10 @@ fn start_hbbs(port: u16, env: &[(&str, &str)]) -> Hbbs {
         .env_remove("WS_PEERS")
         .env_remove("TRUSTED_PROXIES")
         .env_remove("WS_RELAY_SERVERS")
+        .env_remove("AUTHZ_URL")
+        .env_remove("AUTHZ_SECRET")
+        .env_remove("AUTHZ_SECRET_FILE")
+        .env_remove("AUTHZ_FAIL_CLOSED")
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log));
     for (k, v) in env {
@@ -609,4 +616,351 @@ async fn ws_relay_servers_only_for_websocket_clients() {
     let mut a = tcp_secure(&h, A_IP).await;
     a.send(&relay_request(B_ID, &h.licence, "")).await.unwrap();
     expect_forwarded_relay(udp_recv(&mut b, WAIT).await);
+}
+
+/// A call the authorization stub received.
+#[derive(Clone, Debug)]
+struct AuthzCall {
+    request_line: String,
+    authorization: Option<String>,
+    content_type: Option<String>,
+    body: serde_json::Value,
+}
+
+/// An HTTP server standing in for the AUTHZ_URL service. `reply` gets the request body
+/// and returns the status and body to answer with, or None to never answer.
+struct AuthzStub {
+    url: String,
+    calls: Arc<Mutex<Vec<AuthzCall>>>,
+}
+
+impl AuthzStub {
+    fn calls(&self) -> Vec<AuthzCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+fn authz_stub(reply: fn(&serde_json::Value) -> Option<(u16, String)>) -> AuthzStub {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/internal/hbbs/authorize",
+        listener.local_addr().unwrap()
+    );
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen = calls.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let seen = seen.clone();
+            std::thread::spawn(move || serve_authz_call(stream, reply, seen));
+        }
+    });
+    AuthzStub { url, calls }
+}
+
+fn serve_authz_call(
+    mut s: std::net::TcpStream,
+    reply: fn(&serde_json::Value) -> Option<(u16, String)>,
+    seen: Arc<Mutex<Vec<AuthzCall>>>,
+) {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        match s.read(&mut tmp) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+            _ => return,
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let header = |name: &str| {
+        head.split("\r\n").skip(1).find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_owned())
+        })
+    };
+    let len: usize = header("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    while buf.len() < head_end + len {
+        match s.read(&mut tmp) {
+            Ok(n) if n > 0 => buf.extend_from_slice(&tmp[..n]),
+            _ => return,
+        }
+    }
+    let body = serde_json::from_slice(&buf[head_end..head_end + len]).unwrap_or_default();
+    let answer = reply(&body);
+    seen.lock().unwrap().push(AuthzCall {
+        request_line: head.split("\r\n").next().unwrap_or_default().to_owned(),
+        authorization: header("authorization"),
+        content_type: header("content-type"),
+        body,
+    });
+    match answer {
+        Some((status, text)) => {
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                text.len()
+            );
+        }
+        // never answers in time (hbbs gives up after 2 s)
+        None => std::thread::sleep(Duration::from_secs(5)),
+    }
+}
+
+/// Waits until hbbs has logged a line containing every one of `parts`; returns the log.
+async fn wait_log(h: &Hbbs, parts: &[&str]) -> String {
+    let start = Instant::now();
+    loop {
+        let log = std::fs::read_to_string(h.dir.path().join("hbbs.log")).unwrap_or_default();
+        if log.lines().any(|l| parts.iter().all(|p| l.contains(p))) {
+            return log;
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(WAIT),
+            "hbbs never logged a line with {parts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Keyboard enabled (Permission 0, value 2), file transfer disabled (Permission 3,
+/// value 1): RustDesk's 2 bits per permission.
+const PERMS: u64 = 2 | (1 << (2 * 3));
+
+fn authz_reply(body: &serde_json::Value) -> Option<(u16, String)> {
+    let reply = match body["token"].as_str().unwrap_or_default() {
+        "tok-allow" => format!(r#"{{"allow":true,"permissions":"{PERMS}"}}"#),
+        "tok-plain" => r#"{"allow":true,"permissions":"0"}"#.to_owned(),
+        "tok-deny" => r#"{"allow":false,"reason":"Not your device"}"#.to_owned(),
+        "" => r#"{"allow":false}"#.to_owned(),
+        "tok-500" => return Some((500, "{}".to_owned())),
+        "tok-bad" => "not json".to_owned(),
+        "tok-hang" => return None,
+        other => panic!("unexpected token {other}"),
+    };
+    Some((200, reply))
+}
+
+fn punch_request_from(h: &Hbbs, token: &str, conn_type: ConnType) -> RendezvousMessage {
+    let mut msg = punch_request(h, token);
+    if let Some(rendezvous_message::Union::PunchHoleRequest(ph)) = msg.union.as_mut() {
+        ph.conn_type = conn_type.into();
+    }
+    msg
+}
+
+fn permissions_of(field: &MessageField<ControlPermissions>) -> Option<u64> {
+    field.as_ref().map(|p| p.permissions)
+}
+
+fn expect_punch_failure(msg: Option<RendezvousMessage>, reason: &str) {
+    match msg.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::PunchHoleResponse(r)) => {
+            assert_eq!(r.other_failure, reason)
+        }
+        other => panic!("expected a PunchHoleResponse ({reason}), got {other:?}"),
+    }
+}
+
+// AUTHZ_URL (opt-in): each attempt is asked about (bearer secret, JSON body); an allowed
+// one carries the service's permissions to the peer, in PunchHole, FetchLocalAddr and
+// RequestRelay (never the controller's own); decisions are cached.
+#[tokio::test]
+async fn authz_allow_sets_the_peer_permissions() {
+    let stub = authz_stub(authz_reply);
+    let dir = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("authz.secret");
+    std::fs::write(&secret_file, "  s3cret\n").unwrap();
+    let h = start_hbbs(
+        port_for(6),
+        &[
+            ("AUTHZ_URL", &stub.url),
+            // the file wins
+            ("AUTHZ_SECRET", "not-this-one"),
+            ("AUTHZ_SECRET_FILE", secret_file.to_str().unwrap()),
+        ],
+    );
+    let mut b = register_udp_peer(&h).await;
+
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&punch_request(&h, "tok-allow")).await.unwrap();
+    let ph = punch_hole(udp_recv(&mut b, WAIT).await);
+    assert_eq!(permissions_of(&ph.control_permissions), Some(PERMS));
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].request_line, "POST /internal/hbbs/authorize HTTP/1.1");
+    assert_eq!(calls[0].authorization.as_deref(), Some("Bearer s3cret"));
+    assert_eq!(calls[0].content_type.as_deref(), Some("application/json"));
+    assert_eq!(
+        calls[0].body,
+        serde_json::json!({
+            "target_id": B_ID,
+            "token": "tok-allow",
+            "conn_type": 0,
+            "controller_ip": A_IP,
+            "kind": "punch_hole",
+        })
+    );
+
+    // the RequestRelay that follows uses the cached decision; the peer gets the
+    // service's permissions, not the ones the controller sent
+    let mut a = tcp_secure(&h, A_IP).await;
+    let mut msg = relay_request(B_ID, &h.licence, "tok-allow");
+    if let Some(rendezvous_message::Union::RequestRelay(rr)) = msg.union.as_mut() {
+        rr.control_permissions = MessageField::some(ControlPermissions {
+            permissions: u64::MAX,
+            ..Default::default()
+        });
+    }
+    a.send(&msg).await.unwrap();
+    let rr = expect_forwarded_relay(udp_recv(&mut b, WAIT).await);
+    assert_eq!(permissions_of(&rr.control_permissions), Some(PERMS));
+    assert_eq!(stub.calls().len(), 1, "the decision was not cached");
+
+    // another conn_type is another decision
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&punch_request_from(&h, "tok-allow", ConnType::FILE_TRANSFER))
+        .await
+        .unwrap();
+    let ph = punch_hole(udp_recv(&mut b, WAIT).await);
+    assert_eq!(permissions_of(&ph.control_permissions), Some(PERMS));
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].body["conn_type"], 1);
+
+    // behind the peer's IP: FetchLocalAddr, with the permissions too
+    let mut same_ip = tcp_secure(&h, B_IP).await;
+    same_ip.send(&punch_request(&h, "tok-allow")).await.unwrap();
+    match udp_recv(&mut b, WAIT).await.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::FetchLocalAddr(fla)) => {
+            assert_eq!(permissions_of(&fla.control_permissions), Some(PERMS))
+        }
+        other => panic!("expected FetchLocalAddr, got {other:?}"),
+    }
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[2].body["controller_ip"], B_IP);
+
+    // allowed with permissions "0": the field stays unset
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&relay_request(B_ID, &h.licence, "tok-plain")).await.unwrap();
+    let rr = expect_forwarded_relay(udp_recv(&mut b, WAIT).await);
+    assert_eq!(rr.control_permissions, MessageField::none());
+    let calls = stub.calls();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[3].body["kind"], "request_relay");
+    // decisions are logged (at debug), the secret and tokens never are
+    let log = wait_log(&h, &["AUTHZ: request_relay from 127.0.0.1 to", "allowed (service)"]).await;
+    assert!(log.contains("AUTHZ_URL=http://127.0.0.1:"), "{log}");
+    for secret in ["s3cret", "not-this-one", "tok-allow", "tok-plain"] {
+        assert!(!log.contains(secret), "hbbs logged {secret}");
+    }
+}
+
+// A refusal reaches the controller as the other checks' do, and nothing reaches the peer.
+#[tokio::test]
+async fn authz_deny_refuses_and_forwards_nothing() {
+    let stub = authz_stub(authz_reply);
+    let h = start_hbbs(
+        port_for(7),
+        &[("AUTHZ_URL", &stub.url), ("AUTHZ_SECRET", "s3cret")],
+    );
+    let mut b = register_udp_peer(&h).await;
+
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&punch_request(&h, "tok-deny")).await.unwrap();
+    expect_punch_failure(tcp_recv(&mut a, WAIT).await, "Not your device");
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&relay_request(B_ID, &h.licence, "tok-deny")).await.unwrap();
+    expect_refused(tcp_recv(&mut a, WAIT).await, "Not your device");
+    // without a reason: the default one
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&punch_request(&h, "")).await.unwrap();
+    expect_punch_failure(tcp_recv(&mut a, WAIT).await, "Access denied by the server policy");
+    let mut w = ws_connect(&h, A_IP).await;
+    ws_send(&mut w, &relay_request(B_ID, &h.licence, "")).await;
+    expect_refused(ws_recv(&mut w, WAIT).await, "Access denied by the server policy");
+
+    assert!(udp_recv(&mut b, 1000).await.is_none(), "a refused attempt reached the peer");
+    let calls = stub.calls();
+    // one call per (token, conn_type, controller IP); the relay requests were cached
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0].authorization.as_deref(), Some("Bearer s3cret"));
+    assert_eq!(calls[1].body["token"], "");
+
+    // the hook runs after the existing checks: an unknown peer is still ID_NOT_EXIST
+    let mut a = tcp_secure(&h, A_IP).await;
+    let mut msg = punch_request(&h, "tok-deny");
+    if let Some(rendezvous_message::Union::PunchHoleRequest(ph)) = msg.union.as_mut() {
+        ph.id = "nosuchpeer".to_owned();
+    }
+    a.send(&msg).await.unwrap();
+    match tcp_recv(&mut a, WAIT).await.and_then(|m| m.union) {
+        Some(rendezvous_message::Union::PunchHoleResponse(r)) => assert_eq!(
+            r.failure.enum_value(),
+            Ok(punch_hole_response::Failure::ID_NOT_EXIST)
+        ),
+        other => panic!("expected ID_NOT_EXIST, got {other:?}"),
+    }
+    assert_eq!(stub.calls().len(), 2);
+}
+
+// A failed call: through without permissions by default (fail open), refused with
+// AUTHZ_FAIL_CLOSED=Y. Failures are not cached.
+#[tokio::test]
+async fn authz_service_failure_fails_open_or_closed() {
+    // nothing listens there
+    let down = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/internal/hbbs/authorize", l.local_addr().unwrap())
+    };
+    let h = start_hbbs(port_for(8), &[("AUTHZ_URL", &down), ("AUTHZ_SECRET", "s3cret")]);
+    let mut b = register_udp_peer(&h).await;
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&punch_request(&h, "tok-allow")).await.unwrap();
+    let ph = punch_hole(udp_recv(&mut b, WAIT).await);
+    assert_eq!(ph.control_permissions, MessageField::none());
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&relay_request(B_ID, &h.licence, "tok-allow")).await.unwrap();
+    let rr = expect_forwarded_relay(udp_recv(&mut b, WAIT).await);
+    assert_eq!(rr.control_permissions, MessageField::none());
+    // the failure is logged, once per 30 s, without the secret or the token
+    let log = wait_log(&h, &["authorization service call failed (connect error"]).await;
+    assert_eq!(log.matches("authorization service call failed").count(), 1, "{log}");
+    assert!(!log.contains("s3cret") && !log.contains("tok-allow"), "{log}");
+    drop(h);
+
+    let stub = authz_stub(authz_reply);
+    let h = start_hbbs(
+        port_for(9),
+        &[("AUTHZ_URL", &stub.url), ("AUTHZ_FAIL_CLOSED", "Y")],
+    );
+    let mut b = register_udp_peer(&h).await;
+    // a service that does not answer: refused after the 2 s timeout
+    let mut a = tcp_secure(&h, A_IP).await;
+    let start = Instant::now();
+    a.send(&punch_request(&h, "tok-hang")).await.unwrap();
+    expect_punch_failure(tcp_recv(&mut a, 5000).await, "Authorization service unavailable");
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(1900) && took < Duration::from_millis(4000), "{took:?}");
+    // non-200 and a malformed reply
+    for token in ["tok-500", "tok-bad", "tok-500"] {
+        let mut a = tcp_secure(&h, A_IP).await;
+        a.send(&relay_request(B_ID, &h.licence, token)).await.unwrap();
+        expect_refused(tcp_recv(&mut a, WAIT).await, "Authorization service unavailable");
+    }
+    assert!(udp_recv(&mut b, 500).await.is_none(), "a refused attempt reached the peer");
+    // every failure asked again: none was cached
+    assert_eq!(stub.calls().len(), 4);
+    // a working answer still gets through
+    let mut a = tcp_secure(&h, A_IP).await;
+    a.send(&punch_request(&h, "tok-allow")).await.unwrap();
+    let ph = punch_hole(udp_recv(&mut b, WAIT).await);
+    assert_eq!(permissions_of(&ph.control_permissions), Some(PERMS));
 }
