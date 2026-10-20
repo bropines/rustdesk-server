@@ -44,7 +44,7 @@ use std::io::Error;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
     time::Instant,
 };
@@ -59,60 +59,139 @@ enum Data {
 const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
-struct SafeWsSink {
-    sink: WsSink,
-    encrypt: Option<Encrypt>,
+
+// Outgoing queue of one TCP/WebSocket connection (see `Sink`). Rendezvous traffic to a
+// connection is a handful of messages; a full queue means the client stopped reading.
+const SINK_QUEUE_LEN: usize = 64;
+// A write stuck this long (the client does not read) closes the connection.
+const SINK_SEND_TIMEOUT_MS: u64 = 10_000;
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+enum SinkOut {
+    // A serialized message (encrypted by the writer once a key is set); an empty one is
+    // the rendezvous keepalive, which TCP/WebSocket clients echo.
+    Frame(Vec<u8>),
+    // Encrypt the frames queued after this one.
+    Key(Key),
 }
 
-struct SafeTcpStreamSink {
-    sink: TcpStreamSink,
-    encrypt: Option<Encrypt>,
-}
-enum Sink {
-    // TcpStream(TcpStreamSink),
-    // Ws(WsSink),
-    Wss(SafeWsSink),
-    Tss(SafeTcpStreamSink),
+/// Sending half of a TCP/WebSocket rendezvous connection.
+///
+/// The socket's write half is owned by a writer task fed through a bounded queue, so
+/// sending never waits for the client and no map lock (`tcp_punch`, `ws_map`) is held
+/// across socket I/O: a client that stops reading only loses its own messages (they are
+/// dropped once its queue is full) and is disconnected when a write has been stuck for
+/// `SINK_SEND_TIMEOUT_MS`. Clones share the connection; frames go out (and are
+/// encrypted) in queue order.
+#[derive(Clone)]
+struct Sink {
+    tx: mpsc::Sender<SinkOut>,
+    addr: SocketAddr,
 }
 
 impl Sink {
-    /// Sends an already-serialized frame (encrypted when the stream is). An
-    /// empty frame is the rendezvous keepalive: TCP/WebSocket clients echo it.
-    async fn send_raw(&mut self, mut bytes: Vec<u8>) {
-        match self {
-            Sink::Wss(s) => {
-                if let Some(key) = s.encrypt.as_mut() {
+    fn tcp(sink: TcpStreamSink, addr: SocketAddr) -> Self {
+        Self::spawn(sink, Bytes::from, addr)
+    }
+
+    fn ws(sink: WsSink, addr: SocketAddr) -> Self {
+        Self::spawn(sink, tungstenite::Message::Binary, addr)
+    }
+
+    fn spawn<S, M>(mut sink: S, frame: fn(Vec<u8>) -> M, addr: SocketAddr) -> Self
+    where
+        S: hbb_common::futures_util::Sink<M> + Unpin + Send + 'static,
+        S::Error: std::fmt::Debug,
+        M: Send + 'static,
+    {
+        let (tx, mut rx) = mpsc::channel(SINK_QUEUE_LEN);
+        tokio::spawn(async move {
+            let mut encrypt: Option<Encrypt> = None;
+            while let Some(out) = rx.recv().await {
+                let mut bytes = match out {
+                    SinkOut::Key(key) => {
+                        encrypt = Some(Encrypt::new(key));
+                        continue;
+                    }
+                    SinkOut::Frame(bytes) => bytes,
+                };
+                if let Some(key) = encrypt.as_mut() {
                     bytes = key.enc(&bytes);
                 }
-                allow_err!(s.sink.send(tungstenite::Message::Binary(bytes)).await)
-            }
-            Sink::Tss(s) => {
-                if let Some(key) = s.encrypt.as_mut() {
-                    bytes = key.enc(&bytes);
+                match timeout(SINK_SEND_TIMEOUT_MS, sink.send(frame(bytes))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        log::debug!("Write to {:?} failed: {:?}", addr, err);
+                        break;
+                    }
+                    Err(_) => {
+                        log::debug!("Write to {:?} stalled, closing the connection", addr);
+                        break;
+                    }
                 }
-                allow_err!(s.sink.send(Bytes::from(bytes)).await)
             }
+            // Dropping the receiver makes `closed()` resolve for the connection's reader.
+        });
+        Self { tx, addr }
+    }
+
+    /// Queues an already-serialized frame without waiting. False when it was dropped.
+    fn send_raw(&self, bytes: Vec<u8>) -> bool {
+        match self.tx.try_send(SinkOut::Frame(bytes)) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                log::debug!("Send queue of {:?} full, message dropped", self.addr);
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
     }
 
-    async fn send(&mut self, msg: &RendezvousMessage) {
-        if let Ok(mut bytes) = msg.write_to_bytes() {
-            match self {
-                // Sink::TcpStream(mut s) => allow_err!(s.send(Bytes::from(bytes)).await),
-                // Sink::Ws(mut s) => allow_err!(s.send(tungstenite::Message::Binary(bytes)).await),
-                Sink::Wss(s) => {
-                    if let Some(key) = s.encrypt.as_mut() {
-                        bytes = key.enc(&bytes);
-                    }
-                    allow_err!(s.sink.send(tungstenite::Message::Binary(bytes)).await)
-                }
-                Sink::Tss(s) => {
-                    if let Some(key) = s.encrypt.as_mut() {
-                        bytes = key.enc(&bytes);
-                    }
-                    allow_err!(s.sink.send(Bytes::from(bytes)).await)
-                }
-            }
+    fn send(&self, msg: &RendezvousMessage) -> bool {
+        match msg.write_to_bytes() {
+            Ok(bytes) => self.send_raw(bytes),
+            Err(_) => false,
+        }
+    }
+
+    fn set_key(&self, key: Key) -> bool {
+        self.tx.try_send(SinkOut::Key(key)).is_ok()
+    }
+
+    /// Resolves once the writer task has stopped (write error or stalled client).
+    async fn closed(&self) {
+        self.tx.closed().await
+    }
+}
+
+/// A peer registered over WebSocket, keyed by its id in `ws_map`.
+struct WsPeer {
+    // the connection that registered it; only that connection removes the entry
+    conn_id: u64,
+    // the connection's address: the peer's `socket_addr` while this registration is current
+    addr: SocketAddr,
+    sink: Sink,
+}
+
+/// Per-connection state of a TCP/WebSocket rendezvous connection.
+struct StreamConn {
+    id: u64,
+    // Lives as long as the connection, also after the `sink` passed to `handle_tcp` moved
+    // into `tcp_punch`: keepalives and the key exchange use it.
+    sink: Sink,
+    // TCP: receive-side key from the key exchange (the writer task has the send side).
+    rx_key: Option<Encrypt>,
+    // The id this connection registered with an accepted (uuid-checked) RegisterPk.
+    reg_id: Option<String>,
+}
+
+impl StreamConn {
+    fn new(sink: Sink) -> Self {
+        Self {
+            id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
+            sink,
+            rx_key: None,
+            reg_id: None,
         }
     }
 }
@@ -388,20 +467,6 @@ fn webrtc_answer_to_forward(answer: String) -> Result<String, &'static str> {
     }
 }
 
-/// A receive-only copy of an encrypted TCP sink's key at its current receive nonce.
-fn rx_key_snapshot(sink: &Option<Sink>) -> Option<Encrypt> {
-    match sink {
-        Some(Sink::Tss(SafeTcpStreamSink {
-            encrypt: Some(e), ..
-        })) => {
-            let mut k = Encrypt::new(e.0.clone());
-            k.2 = e.2;
-            Some(k)
-        }
-        _ => None,
-    }
-}
-
 fn ice_candidate_is_valid(ice: &IceCandidate) -> bool {
     !ice.candidate.is_empty()
         && ice.candidate.len() <= MAX_ICE_CANDIDATE_LEN
@@ -508,7 +573,8 @@ pub struct RendezvousServer {
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
-    ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    // Peers registered over WebSocket, by id (bound at an accepted RegisterPk).
+    ws_map: Arc<Mutex<HashMap<String, WsPeer>>>,
     webrtc_routes: Arc<Mutex<WebrtcRoutes>>,
 }
 
@@ -926,6 +992,7 @@ impl RendezvousServer {
         &mut self,
         bytes: &[u8],
         sink: &mut Option<Sink>,
+        conn: &mut StreamConn,
         addr: SocketAddr,
         key: &str,
         ws: bool,
@@ -971,18 +1038,10 @@ impl RendezvousServer {
                     if let Some(peer) = self.pm.get(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
+                        let id = rf.id.clone();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        let mut map = self.ws_map.lock().await;
-                        let key = try_into_v4(peer_addr);
-                        let sent = match map.get_mut(&key) {
-                            Some(s) => {
-                                s.send(&msg_out).await;
-                                true
-                            }
-                            None => false,
-                        };
-                        drop(map);
+                        let sent = self.send_to_ws_peer(&id, peer_addr, &msg_out, false).await;
                         if !sent {
                             self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
                         }
@@ -1037,6 +1096,7 @@ impl RendezvousServer {
                     Self::send_to_sink(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    let id = rk.id.clone();
                     let response = self.handle_register_pk(rk, addr, ws).await;
                     match response {
                         Err(err) => {
@@ -1055,11 +1115,23 @@ impl RendezvousServer {
                                 ..Default::default()
                             });
                             Self::send_to_sink(sink, msg_out).await;
-                            if ws {
-                                // for ws, we can only get addr when register_pk
-                                if let Some(sink) = sink.take() {
-                                    self.ws_map.lock().await.insert(try_into_v4(addr), sink);
+                            // The id is bound to this connection only once accepted.
+                            if let Some(old) = conn.reg_id.replace(id.clone()) {
+                                if ws && old != id {
+                                    self.remove_ws_peer(&old, conn.id).await;
                                 }
+                            }
+                            if ws {
+                                // for ws, we can only get addr when register_pk; the
+                                // connection keeps its own sink for its replies
+                                self.ws_map.lock().await.insert(
+                                    id,
+                                    WsPeer {
+                                        conn_id: conn.id,
+                                        addr: try_into_v4(addr),
+                                        sink: conn.sink.clone(),
+                                    },
+                                );
                             }
                             return true;
                         }
@@ -1092,12 +1164,11 @@ impl RendezvousServer {
                     let key = secretbox::Key::from_slice(&symetric_key);
                     match key {
                         Some(key) => {
-                            if let Some(sink) = sink.as_mut() {
-                                match sink {
-                                    Sink::Wss(s) => s.encrypt = Some(Encrypt::new(key)),
-                                    Sink::Tss(s) => s.encrypt = Some(Encrypt::new(key)),
-                                }
+                            // the writer task encrypts what is queued from now on
+                            if !conn.sink.set_key(key.clone()) {
+                                return false;
                             }
+                            conn.rx_key = Some(Encrypt::new(key));
                             log::debug!("KeyExchange symetric key set");
                             return true;
                         }
@@ -1615,9 +1686,10 @@ impl RendezvousServer {
         if !self.webrtc_routes.lock().await.contains(&key) {
             return None;
         }
-        match self.tcp_punch.lock().await.get_mut(&key) {
+        // non-blocking: the sink only queues
+        match self.tcp_punch.lock().await.get(&key) {
             Some(sink) => {
-                sink.send(msg).await;
+                sink.send(msg);
                 Some(true)
             }
             None => Some(false),
@@ -1663,9 +1735,9 @@ impl RendezvousServer {
                 candidate: ice.candidate,
                 ..Default::default()
             });
-            let delivered = match self.tcp_punch.lock().await.get_mut(&controller) {
+            let delivered = match self.tcp_punch.lock().await.get(&controller) {
                 Some(sink) => {
-                    sink.send(&msg_out).await;
+                    sink.send(&msg_out);
                     true
                 }
                 None => false,
@@ -1728,13 +1800,9 @@ impl RendezvousServer {
                 ..Default::default()
             });
             // Deliver the way PunchHole reached the peer: its WebSocket sink, else UDP.
-            let sent = match self.ws_map.lock().await.get_mut(&try_into_v4(peer_addr)) {
-                Some(s) => {
-                    s.send(&msg_out).await;
-                    true
-                }
-                None => false,
-            };
+            let sent = self
+                .send_to_ws_peer(&ice.id, peer_addr, &msg_out, false)
+                .await;
             if !sent {
                 self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
             }
@@ -1770,8 +1838,40 @@ impl RendezvousServer {
 
     #[inline]
     async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
-        if let Some(sink) = sink.as_mut() {
-            sink.send(&msg).await;
+        if let Some(sink) = sink.as_ref() {
+            sink.send(&msg);
+        }
+    }
+
+    /// Sends `msg` to peer `id` over its WebSocket registration, as long as that is still
+    /// the peer's current registration (`peer_addr` is the connection's address);
+    /// `consume` ends the registration afterwards. False: the caller falls back to UDP.
+    /// Never waits on the socket.
+    async fn send_to_ws_peer(
+        &self,
+        id: &str,
+        peer_addr: SocketAddr,
+        msg: &RendezvousMessage,
+        consume: bool,
+    ) -> bool {
+        let mut map = self.ws_map.lock().await;
+        match map.get(id) {
+            Some(p) if p.addr == try_into_v4(peer_addr) => {
+                p.sink.send(msg);
+                if consume || p.sink.tx.is_closed() {
+                    map.remove(id);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Removes `id`'s WebSocket registration if connection `conn_id` owns it.
+    async fn remove_ws_peer(&self, id: &str, conn_id: u64) {
+        let mut map = self.ws_map.lock().await;
+        if map.get(id).map(|p| p.conn_id) == Some(conn_id) {
+            map.remove(id);
         }
     }
 
@@ -1795,6 +1895,7 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        let id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
             // Keep the WebSocket sink registered: removing it here left the peer
@@ -1805,27 +1906,9 @@ impl RendezvousServer {
                 &msg.union,
                 Some(rendezvous_message::Union::PunchHole(p)) if !p.webrtc_sdp_offer.is_empty()
             );
-            let mut map = self.ws_map.lock().await;
-            let key = try_into_v4(addr);
-            let sent = if TCP_KEEPALIVE.load(Ordering::SeqCst) || webrtc_offer {
-                match map.get_mut(&key) {
-                    Some(s) => {
-                        s.send(&msg).await;
-                        true
-                    }
-                    None => false,
-                }
-            } else {
-                // upstream behaviour: the sink is consumed by the first request
-                match map.remove(&key) {
-                    Some(mut s) => {
-                        s.send(&msg).await;
-                        true
-                    }
-                    None => false,
-                }
-            };
-            drop(map);
+            // upstream behaviour otherwise: the sink is consumed by the first request
+            let consume = !(TCP_KEEPALIVE.load(Ordering::SeqCst) || webrtc_offer);
+            let sent = self.send_to_ws_peer(&id, addr, &msg, consume).await;
             if webrtc_offer {
                 log::debug!(
                     "WebRTC offer to {:?} sent via {}",
@@ -2200,6 +2283,7 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
+        let mut conn;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
@@ -2228,10 +2312,10 @@ impl RendezvousServer {
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
-            sink = Some(Sink::Wss(SafeWsSink {
-                sink: a,
-                encrypt: None,
-            }));
+            conn = StreamConn::new(Sink::ws(a, addr));
+            sink = Some(conn.sink.clone());
+            // ends the connection once its writer task stopped
+            let writer = conn.sink.clone();
             let mut reg_id: Option<String> = None;
             let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
             // Idle deadline is created once and only pushed forward when a frame
@@ -2248,32 +2332,29 @@ impl RendezvousServer {
                         if self.on_stream_frame(&bytes, &mut reg_id).await {
                             continue; // keepalive echo
                         }
-                        if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                        if !self.handle_tcp(&bytes, &mut sink, &mut conn, addr, key, ws).await {
                             break;
                         }
                     }
+                    _ = writer.closed() => break,
                     _ = &mut idle => break,
                     _ = keepalive.tick() => {
                         if reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
-                            self.send_keepalive(&mut sink, addr, ws).await;
+                            conn.sink.send_raw(Vec::new());
                         }
                     }
                 }
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::Tss(SafeTcpStreamSink {
-                sink: a,
-                encrypt: None,
-            }));
+            conn = StreamConn::new(Sink::tcp(a, addr));
+            sink = Some(conn.sink.clone());
+            let writer = conn.sink.clone();
             // Avoid key exchange if answering on nat helper port
             if !key.is_empty() {
                 self.key_exchange_phase1(addr, &mut sink).await;
             }
             let mut reg_id: Option<String> = None;
-            // Receive-side key once the sink (and its key) moved into tcp_punch, so
-            // later frames on this connection (punch retries, trickle ICE) still decrypt.
-            let mut rx_key: Option<Encrypt> = None;
             let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
             let idle = tokio::time::sleep(Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
             tokio::pin!(idle);
@@ -2283,11 +2364,9 @@ impl RendezvousServer {
                         let Some(Ok(mut bytes)) = res else { break };
                         idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
                         // log::debug!("receive tcp data from {:?} {:?}", addr, bytes);
-                        let dec = match sink.as_mut() {
-                            Some(Sink::Tss(s)) => s.encrypt.as_mut(),
-                            _ => rx_key.as_mut(),
-                        };
-                        if let Some(key) = dec {
+                        // The receive key stays with the connection, also after its sink
+                        // moved into tcp_punch (punch retries, trickle ICE still decrypt).
+                        if let Some(key) = conn.rx_key.as_mut() {
                             if let Err(err) = key.dec(&mut bytes) {
                                 log::error!("dec tcp data from {:?} err: {:?}", addr, err);
                                 break;
@@ -2296,19 +2375,15 @@ impl RendezvousServer {
                         if self.on_stream_frame(&bytes, &mut reg_id).await {
                             continue; // keepalive echo
                         }
-                        let snapshot = rx_key_snapshot(&sink);
-                        let keep = self.handle_tcp(&bytes, &mut sink, addr, key, ws).await;
-                        if sink.is_none() && rx_key.is_none() {
-                            rx_key = snapshot;
-                        }
-                        if !keep {
+                        if !self.handle_tcp(&bytes, &mut sink, &mut conn, addr, key, ws).await {
                             break;
                         }
                     }
+                    _ = writer.closed() => break,
                     _ = &mut idle => break,
                     _ = keepalive.tick() => {
                         if reg_id.is_some() && TCP_KEEPALIVE.load(Ordering::SeqCst) {
-                            self.send_keepalive(&mut sink, addr, ws).await;
+                            conn.sink.send_raw(Vec::new());
                         }
                     }
                 }
@@ -2317,6 +2392,10 @@ impl RendezvousServer {
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
             self.webrtc_routes.lock().await.remove(&try_into_v4(addr));
+        }
+        if let Some(id) = conn.reg_id.as_deref() {
+            // the WebSocket registration ends with the connection
+            self.remove_ws_peer(id, conn.id).await;
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
@@ -2353,18 +2432,6 @@ impl RendezvousServer {
         if let Some(id) = id {
             if let Some(peer) = self.pm.get_in_memory(id).await {
                 peer.write().await.last_reg_time = Instant::now();
-            }
-        }
-    }
-
-    /// Sends the empty keepalive frame. WebSocket sinks are moved into
-    /// `ws_map` on registration, so look there when the local one is gone.
-    async fn send_keepalive(&self, sink: &mut Option<Sink>, addr: SocketAddr, ws: bool) {
-        if let Some(s) = sink.as_mut() {
-            s.send_raw(Vec::new()).await;
-        } else if ws {
-            if let Some(s) = self.ws_map.lock().await.get_mut(&try_into_v4(addr)) {
-                s.send_raw(Vec::new()).await;
             }
         }
     }
@@ -2668,6 +2735,45 @@ mod tests {
 
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    #[hbb_common::tokio::test]
+    async fn sink_never_waits_for_a_client_that_does_not_read() {
+        // the client's socket never accepts a write
+        let stalled = hbb_common::futures_util::sink::unfold((), |_, _: Vec<u8>| {
+            std::future::pending::<Result<(), std::io::Error>>()
+        });
+        let s = Sink::spawn(Box::pin(stalled), |b| b, sa("1.2.3.4:5"));
+        let mut queued = 0;
+        for _ in 0..SINK_QUEUE_LEN * 2 {
+            if s.send_raw(vec![1]) {
+                queued += 1;
+            }
+        }
+        // the writer holds one frame, the queue the rest; everything else is dropped
+        assert!(queued >= SINK_QUEUE_LEN && queued <= SINK_QUEUE_LEN + 1);
+        assert!(!s.send(&RendezvousMessage::new()));
+    }
+
+    #[hbb_common::tokio::test]
+    async fn sink_sends_in_order_and_encrypts_after_the_key() {
+        use hbb_common::futures::channel::mpsc as fmpsc;
+        let (tx, mut rx) = fmpsc::unbounded::<Vec<u8>>();
+        let s = Sink::spawn(tx, |b| b, sa("1.2.3.4:5"));
+        let key = secretbox::gen_key();
+        assert!(s.send_raw(b"plain".to_vec()));
+        assert!(s.set_key(key.clone()));
+        assert!(s.send_raw(b"secret".to_vec()));
+        assert_eq!(rx.next().await.unwrap(), b"plain".to_vec());
+        let enc = rx.next().await.unwrap();
+        assert_ne!(enc, b"secret".to_vec());
+        let mut bytes = BytesMut::from(&enc[..]);
+        Encrypt::new(key).dec(&mut bytes).unwrap();
+        assert_eq!(&bytes[..], b"secret");
+        // the writer stops when the socket is gone; the connection's reader notices
+        drop(rx);
+        assert!(s.send_raw(b"x".to_vec()));
+        timeout(3000, s.closed()).await.unwrap();
     }
 
     #[test]
