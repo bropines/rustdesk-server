@@ -301,6 +301,20 @@ static MUST_LOGIN: AtomicBool = AtomicBool::new(false);
 // Opt-in keepalive for TCP/WebSocket rendezvous clients (see TCP_KEEPALIVE_MS).
 // Off by default: behaviour then matches upstream hbbs.
 static TCP_KEEPALIVE: AtomicBool = AtomicBool::new(false);
+// Opt-in: forward RequestRelay to a peer registered over WebSocket on that connection.
+// Off by default: RequestRelay goes over UDP to the peer's address, as upstream.
+static WS_PEERS: AtomicBool = AtomicBool::new(false);
+// Bounds for a client's RequestRelay, which hbbs forwards to the peer (upstream forwards
+// any size). A uuid is 36 characters, a relay server a host:port, a token a JWT.
+const MAX_RELAY_UUID_LEN: usize = 64;
+const MAX_RELAY_SERVER_LEN: usize = 255;
+const MAX_TOKEN_LEN: usize = 4096;
+const MAX_RELAY_REQUEST_LEN: u64 = 8 * 1024;
+// RustDesk clients send the licence key in PunchHoleRequest, and not in the RequestRelay
+// they send to hbbs when the direct connection then fails (only to hbbr). A RequestRelay
+// without a key is accepted from an IP that passed the key check for that peer recently.
+const RELAY_GRANT_TTL_MS: u128 = 120_000;
+const RELAY_GRANTS_MAX: usize = 100_000;
 // Opt-in WebRTC signaling for RustDesk >= 1.5.0 clients (see `WebrtcRoutes`). Off by
 // default: the offer/answer fields are then dropped and IceCandidate messages close
 // the connection, exactly like upstream hbbs.
@@ -563,6 +577,93 @@ fn webrtc_answer_to_forward(answer: String) -> Result<String, &'static str> {
     }
 }
 
+static RELAY_GRANTS: Lazy<std::sync::Mutex<HashMap<(IpAddr, String), Instant>>> =
+    Lazy::new(Default::default);
+
+/// Records that `ip` passed the PunchHoleRequest checks (key, MUST_LOGIN) for peer `id`.
+fn grant_relay(ip: IpAddr, id: &str) {
+    if let Ok(mut grants) = RELAY_GRANTS.lock() {
+        if grants.len() >= RELAY_GRANTS_MAX {
+            grants.retain(|_, t| t.elapsed().as_millis() < RELAY_GRANT_TTL_MS);
+            if grants.len() >= RELAY_GRANTS_MAX {
+                return;
+            }
+        }
+        grants.insert((unmap_ip(ip), id.to_owned()), Instant::now());
+    }
+}
+
+fn relay_granted(ip: IpAddr, id: &str) -> bool {
+    RELAY_GRANTS
+        .lock()
+        .ok()
+        .and_then(|grants| {
+            grants
+                .get(&(unmap_ip(ip), id.to_owned()))
+                .map(|t| t.elapsed().as_millis() < RELAY_GRANT_TTL_MS)
+        })
+        .unwrap_or(false)
+}
+
+/// MUST_LOGIN, for PunchHoleRequest and RequestRelay alike. Err holds the reason for
+/// the log and the message for the client.
+fn check_login(token: &str) -> Result<(), (&'static str, &'static str)> {
+    if !MUST_LOGIN.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if token.is_empty() {
+        return Err(("no token", "Connection failed, please login!"));
+    }
+    // if secret is not empty check token by jwt
+    if !jwt::SECRET.is_empty() && jwt::verify_token(token).is_err() {
+        // Ask the user to sign in again.
+        return Err((
+            "invalid token",
+            "Token error, please log out and log back in!",
+        ));
+    }
+    Ok(())
+}
+
+fn relay_request_fields_ok(rf: &RequestRelay) -> bool {
+    !rf.id.is_empty()
+        && rf.id.len() <= MAX_PEER_ID_LEN
+        && rf.uuid.len() <= MAX_RELAY_UUID_LEN
+        && rf.relay_server.len() <= MAX_RELAY_SERVER_LEN
+        && rf.token.len() <= MAX_TOKEN_LEN
+        && rf.compute_size() <= MAX_RELAY_REQUEST_LEN
+}
+
+/// The checks PunchHoleRequest has, for a client's RequestRelay (upstream has none):
+/// size, licence key and MUST_LOGIN. Err is the refuse reason for the client.
+fn check_relay_request(rf: &RequestRelay, addr: SocketAddr, key: &str) -> Result<(), &'static str> {
+    if !relay_request_fields_ok(rf) {
+        log::warn!("Relay request from {} refused: missing or oversized fields", addr);
+        return Err("Invalid relay request");
+    }
+    if !key.is_empty()
+        && rf.licence_key != key
+        && !(rf.licence_key.is_empty() && relay_granted(addr.ip(), &rf.id))
+    {
+        log::warn!(
+            "Authentication failed from {} for relay to peer {} - invalid key",
+            addr,
+            rf.id
+        );
+        return Err("Key mismatch");
+    }
+    if let Err((why, msg)) = check_login(&rf.token) {
+        log::warn!(
+            "MUST_LOGIN rejected relay request from {} for peer {} - {}",
+            addr,
+            rf.id,
+            why
+        );
+        return Err(msg);
+    }
+    Ok(())
+}
+
 fn ice_candidate_is_valid(ice: &IceCandidate) -> bool {
     !ice.candidate.is_empty()
         && ice.candidate.len() <= MAX_ICE_CANDIDATE_LEN
@@ -802,6 +903,13 @@ impl RendezvousServer {
         log::info!(
             "WEBRTC={}",
             if WEBRTC.load(Ordering::SeqCst) { "Y" } else { "N" }
+        );
+        if get_arg("ws-peers").to_uppercase() == "Y" {
+            WS_PEERS.store(true, Ordering::SeqCst);
+        }
+        log::info!(
+            "WS_PEERS={}",
+            if WS_PEERS.load(Ordering::SeqCst) { "Y" } else { "N" }
         );
         log::info!(
             "TRUSTED_PROXIES={:?} (plus loopback; WebSocket X-Real-IP/X-Forwarded-For)",
@@ -1152,15 +1260,38 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if let Some(peer) = self.pm.get(&rf.id).await {
+                    if let Err(reason) = check_relay_request(&rf, addr, key) {
                         let mut msg_out = RendezvousMessage::new();
-                        rf.socket_addr = AddrMangle::encode(addr).into();
-                        let id = rf.id.clone();
-                        msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        let sent = self.send_to_ws_peer(&id, peer_addr, &msg_out, false).await;
-                        if !sent {
-                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        msg_out.set_relay_response(RelayResponse {
+                            refuse_reason: reason.to_owned(),
+                            ..Default::default()
+                        });
+                        self.send_to_tcp_sync(msg_out, addr).await;
+                        return true;
+                    }
+                    // In-memory peers only, as upstream (a peer loaded from the database
+                    // has no address), and only online ones, as for PunchHoleRequest.
+                    if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
+                        let (elapsed, peer_addr) = {
+                            let r = peer.read().await;
+                            (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
+                        };
+                        if elapsed < REG_TIMEOUT {
+                            let mut msg_out = RendezvousMessage::new();
+                            rf.socket_addr = AddrMangle::encode(addr).into();
+                            // The controlled peer uses neither; the token is the
+                            // controller's login.
+                            rf.token.clear();
+                            rf.licence_key.clear();
+                            let id = rf.id.clone();
+                            msg_out.set_request_relay(rf);
+                            // Opt-in (WS_PEERS): to a peer registered over WebSocket on
+                            // that connection. Upstream: UDP to the peer's address.
+                            let sent = WS_PEERS.load(Ordering::SeqCst)
+                                && self.send_to_ws_peer(&id, peer_addr, &msg_out, false).await;
+                            if !sent {
+                                self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                            }
                         }
                     }
                     return true;
@@ -1616,30 +1747,14 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        // if secret is not empty check token by jwt
-        if MUST_LOGIN.load(Ordering::SeqCst) {
-            if ph.token.is_empty() {
-                log::warn!("MUST_LOGIN rejected from {} for peer {} - no token", addr, ph.id);
-                let mut msg_out = RendezvousMessage::new();
-                msg_out.set_punch_hole_response(PunchHoleResponse {
-                    other_failure: String::from("Connection failed, please login!"),
-                    ..Default::default()
-                });
-                return Ok((msg_out, None));
-            } else if !jwt::SECRET.is_empty() {
-                let token = ph.token;
-                let token = jwt::verify_token(token.as_str());
-                if token.is_err() {
-                    log::warn!("MUST_LOGIN rejected from {} for peer {} - invalid token", addr, ph.id);
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_punch_hole_response(PunchHoleResponse {
-                        // Ask the user to sign in again.
-                        other_failure: String::from("Token error, please log out and log back in!"),
-                        ..Default::default()
-                    });
-                    return Ok((msg_out, None));
-                }
-            }
+        if let Err((why, failure)) = check_login(&ph.token) {
+            log::warn!("MUST_LOGIN rejected from {} for peer {} - {}", addr, ph.id, why);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: failure.to_owned(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
         }
         let id = ph.id;
         // punch hole request from A, relay to B,
@@ -1668,6 +1783,8 @@ impl RendezvousServer {
                 id.clone(),
             )
             .await;
+            // a RequestRelay to this peer from this IP may follow without the key
+            grant_relay(try_into_v4(addr).ip(), &id);
 
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
@@ -2146,7 +2263,7 @@ impl RendezvousServer {
         match fds.next() {
             Some("h") => {
                 res = format!(
-                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+                    "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
                     "relay-servers(rs) <separated by ,>",
                     "reload-geo(rg)",
                     "ip-blocker(ib) [<ip>|<number>] [-]",
@@ -2157,6 +2274,7 @@ impl RendezvousServer {
                     "must-login(ml) [Y|N]",
                     "tcp-keepalive(tk) [Y|N]",
                     "webrtc(wr) [Y|N]",
+                    "ws-peers(wp) [Y|N]",
                 )
             }
             Some("relay-servers" | "rs") => {
@@ -2324,6 +2442,13 @@ impl RendezvousServer {
                     );
                 } else {
                     let _ = writeln!(res, "WEBRTC: {:?}", WEBRTC.load(Ordering::SeqCst));
+                }
+            }
+            Some("ws-peers" | "wp") => {
+                if let Some(v) = fds.next() {
+                    WS_PEERS.store(v.to_uppercase() == "Y", Ordering::SeqCst);
+                } else {
+                    let _ = writeln!(res, "WS_PEERS: {:?}", WS_PEERS.load(Ordering::SeqCst));
                 }
             }
             Some("must-login" | "ml") => {
@@ -2892,6 +3017,79 @@ mod tests {
             ws_client_addr(sa("10.9.9.9:1"), None, Some("8.8.8.8"), &proxies),
             sa("8.8.8.8:1")
         );
+    }
+
+    fn relay_request() -> RequestRelay {
+        RequestRelay {
+            id: "peer123".to_owned(),
+            uuid: "x".repeat(36),
+            relay_server: "relay.example.com:21117".to_owned(),
+            token: "t".repeat(400),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn relay_request_size_caps() {
+        let ok = relay_request();
+        assert!(relay_request_fields_ok(&ok));
+        let bad = [
+            RequestRelay { id: String::new(), ..ok.clone() },
+            RequestRelay { id: "x".repeat(MAX_PEER_ID_LEN + 1), ..ok.clone() },
+            RequestRelay { uuid: "x".repeat(MAX_RELAY_UUID_LEN + 1), ..ok.clone() },
+            RequestRelay { relay_server: "x".repeat(MAX_RELAY_SERVER_LEN + 1), ..ok.clone() },
+            RequestRelay { token: "x".repeat(MAX_TOKEN_LEN + 1), ..ok.clone() },
+            RequestRelay { switch_code: "x".repeat(MAX_RELAY_REQUEST_LEN as usize), ..ok.clone() },
+        ];
+        for rf in bad.iter() {
+            assert!(!relay_request_fields_ok(rf));
+            assert_eq!(
+                check_relay_request(rf, sa("198.51.100.9:1"), ""),
+                Err("Invalid relay request")
+            );
+        }
+    }
+
+    #[test]
+    fn relay_request_needs_the_key_or_a_recent_punch() {
+        let addr = sa("198.51.100.1:1000");
+        let key = "server-key";
+        let rf = relay_request();
+        // no key configured: as upstream
+        assert_eq!(check_relay_request(&rf, addr, ""), Ok(()));
+        let with_key = RequestRelay { licence_key: key.to_owned(), ..rf.clone() };
+        let wrong_key = RequestRelay { licence_key: "wrong".to_owned(), ..rf.clone() };
+        assert_eq!(check_relay_request(&with_key, addr, key), Ok(()));
+        assert_eq!(check_relay_request(&wrong_key, addr, key), Err("Key mismatch"));
+        // RustDesk clients leave the key out after a PunchHoleRequest that carried it
+        assert_eq!(check_relay_request(&rf, addr, key), Err("Key mismatch"));
+        grant_relay(sa("[::ffff:198.51.100.1]:5").ip(), "peer123");
+        assert_eq!(check_relay_request(&rf, addr, key), Ok(()));
+        // the grant is for that IP and that peer only, and never excuses a wrong key
+        assert_eq!(
+            check_relay_request(&rf, sa("198.51.100.2:1000"), key),
+            Err("Key mismatch")
+        );
+        let other_peer = RequestRelay { id: "peer124".to_owned(), ..rf.clone() };
+        assert_eq!(check_relay_request(&other_peer, addr, key), Err("Key mismatch"));
+        assert_eq!(check_relay_request(&wrong_key, addr, key), Err("Key mismatch"));
+    }
+
+    #[test]
+    fn relay_request_respects_must_login() {
+        let addr = sa("198.51.100.3:1000");
+        let no_token = RequestRelay { token: String::new(), ..relay_request() };
+        MUST_LOGIN.store(true, Ordering::SeqCst);
+        assert_eq!(
+            check_relay_request(&no_token, addr, ""),
+            Err("Connection failed, please login!")
+        );
+        if jwt::SECRET.is_empty() {
+            // without RUSTDESK_API_JWT_KEY any token passes, as for PunchHoleRequest
+            assert_eq!(check_relay_request(&relay_request(), addr, ""), Ok(()));
+        }
+        MUST_LOGIN.store(false, Ordering::SeqCst);
+        assert_eq!(check_relay_request(&no_token, addr, ""), Ok(()));
     }
 
     #[hbb_common::tokio::test]
