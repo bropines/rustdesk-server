@@ -181,7 +181,9 @@ default **fails open**: the attempt goes through without permissions, as with
 `AUTHZ_URL` unset. With `AUTHZ_FAIL_CLOSED=Y` (or `--authz-fail-closed Y`) it is refused
 ("Authorization service unavailable"). HTTP 400, 413 and 422 are refused either way
 ("Invalid connection request"): they answer the attempt itself, whose fields the controller
-chose, so failing open on them would let a controller skip the decision. Failures are logged at warn level, at most once
+chose, so failing open on them would let a controller skip the decision. At most 128 calls wait
+for the service at once; past that, new uncached attempts are refused ("Server busy,
+please try again") either way, so a flood that ties the service up does not fail open. Failures are logged at warn level, at most once
 per 30 s; with `RUST_LOG=info,hbbs=debug` every decision is logged.
 
 The secret is read from `AUTHZ_SECRET_FILE` (or `--authz-secret-file`), else

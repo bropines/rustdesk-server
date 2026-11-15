@@ -49,7 +49,10 @@ use serde_derive::Deserialize;
 use std::{
     collections::HashMap,
     net::IpAddr,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -66,6 +69,12 @@ const MAX_REASON_LEN: usize = 256;
 pub(crate) const DENIED: &str = "Access denied by the server policy";
 pub(crate) const UNAVAILABLE: &str = "Authorization service unavailable";
 pub(crate) const INVALID: &str = "Invalid connection request";
+pub(crate) const BUSY: &str = "Server busy, please try again";
+
+// Calls to the service at once. A flood that times the service out would otherwise
+// fail open for every attempt; past this many, new uncached attempts are refused
+// ("Server busy") whatever AUTHZ_FAIL_CLOSED says, and the controller retries.
+const MAX_IN_FLIGHT: usize = 128;
 
 // Statuses that answer the request itself (malformed, too large, not processable)
 // rather than say the service is unavailable. The attempt's fields come from the
@@ -80,6 +89,8 @@ enum CallError {
     Unavailable(String),
     /// The service refused to read this attempt (REFUSED_STATUSES): always a refusal.
     Refused(u16),
+    /// MAX_IN_FLIGHT calls are waiting already: always a refusal.
+    Busy,
 }
 
 static AUTHZ: OnceCell<Authz> = OnceCell::new();
@@ -213,6 +224,8 @@ struct Authz {
     client: reqwest::Client,
     cache: Mutex<Cache>,
     last_error_log: Mutex<Option<Instant>>,
+    // calls in flight (bounded by MAX_IN_FLIGHT)
+    in_flight: AtomicUsize,
 }
 
 impl Authz {
@@ -236,6 +249,7 @@ impl Authz {
             client,
             cache: Default::default(),
             last_error_log: Default::default(),
+            in_flight: AtomicUsize::new(0),
         })
     }
 
@@ -249,7 +263,7 @@ impl Authz {
             .and_then(|mut cache| cache.get(&key, Instant::now()));
         let (verdict, how) = match cached {
             Some(verdict) => (verdict, "cached"),
-            None => match self.call(attempt).await {
+            None => match self.call_bounded(attempt).await {
                 Ok(verdict) => {
                     if let Ok(mut cache) = self.cache.lock() {
                         cache.insert(key, verdict.clone(), Instant::now());
@@ -260,6 +274,7 @@ impl Authz {
                     self.log_error(&why);
                     (self.on_error(), "service failed")
                 }
+                Err(CallError::Busy) => (Verdict::Deny(BUSY.to_owned()), "too many calls in flight"),
                 Err(CallError::Refused(status)) => {
                     log::debug!("AUTHZ: service refused to read the attempt (HTTP {})", status);
                     (Verdict::Deny(INVALID.to_owned()), "service refused the request")
@@ -293,6 +308,23 @@ impl Authz {
         } else {
             Verdict::Allow(0)
         }
+    }
+
+    /// `call`, unless MAX_IN_FLIGHT calls are already waiting for the service.
+    async fn call_bounded(&self, attempt: &Attempt<'_>) -> Result<Verdict, CallError> {
+        // released on drop, so a caller that gives up mid-call frees its slot too
+        struct Slot<'a>(&'a AtomicUsize);
+        impl Drop for Slot<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let slot = Slot(&self.in_flight);
+        if slot.0.fetch_add(1, Ordering::AcqRel) >= MAX_IN_FLIGHT {
+            self.log_error("too many calls in flight");
+            return Err(CallError::Busy);
+        }
+        self.call(attempt).await
     }
 
     async fn call(&self, attempt: &Attempt<'_>) -> Result<Verdict, CallError> {
@@ -737,6 +769,21 @@ mod tests {
                 "kind": "punch_hole",
             })
         );
+    }
+
+    #[tokio::test]
+    async fn too_many_calls_in_flight_are_refused_even_failing_open() {
+        // A flood that keeps the service busy must not turn into fail-open allows.
+        let (url, seen) = stub(200, r#"{"allow":true}"#).await;
+        let open = Authz::new(&url, String::new(), false).unwrap();
+        open.in_flight.store(MAX_IN_FLIGHT, Ordering::SeqCst);
+        assert_eq!(open.check(&attempt("tok", 0)).await, Verdict::Deny(BUSY.to_owned()));
+        assert_eq!(seen.lock().unwrap().len(), 0, "the service was called anyway");
+        assert_eq!(open.in_flight.load(Ordering::SeqCst), MAX_IN_FLIGHT, "slot not released");
+        // A free slot: called, and the slot is released afterwards.
+        open.in_flight.store(MAX_IN_FLIGHT - 1, Ordering::SeqCst);
+        assert_eq!(open.check(&attempt("tok2", 0)).await, Verdict::Allow(0));
+        assert_eq!(open.in_flight.load(Ordering::SeqCst), MAX_IN_FLIGHT - 1);
     }
 
     #[tokio::test]
