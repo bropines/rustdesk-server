@@ -13,6 +13,11 @@ on:
     tags:
       - 'test.*'
 
+
+# Read-only: this workflow publishes nothing to the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   LATEST_TAG: latest
@@ -170,7 +175,7 @@ jobs:
       # manifest for :1.2.3 tag
       #  this has to run only if invoked by a new tag
       - name: Create and push manifest (:ve.rs.ion)
-        uses: Noelware/docker-manifest-action@master
+        uses: Noelware/docker-manifest-action@8563a4c01cfd9cd9cc4093fe2cd53b62484e9791 # master
         with:
           tags: ${{ secrets.DOCKER_IMAGE }}:${{ env.GIT_TAG }}
           inputs: |
