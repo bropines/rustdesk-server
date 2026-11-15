@@ -14,7 +14,7 @@ Default branch: **`rdpanel`**. RD Panel's container image pins a commit of this 
 | feature | how to enable | origin |
 |---|---|---|
 | Require a signed-in RustDesk client to connect | `MUST_LOGIN=Y` (or `--must-login Y`, admin command `must-login Y\|N`) | lejianwen |
-| Validate client tokens as JWT (HS256) | `RUSTDESK_API_JWT_KEY=<same key as the API server>` | lejianwen |
+| Validate client tokens as JWT (HS256); without it `MUST_LOGIN` accepts any non-empty token, and hbbs warns about that on start | `RUSTDESK_API_JWT_KEY=<same key as the API server>` | lejianwen |
 | No connection timeouts for clients signed in to an API server | always on | lejianwen |
 | WebSocket clients (client ≥ 1.4.1) | ports 21118/21119 | lejianwen |
 | Keepalive for TCP/WebSocket rendezvous clients | `TCP_KEEPALIVE=Y` (or `--tcp-keepalive Y`, admin command `tcp-keepalive Y\|N`) | this fork |

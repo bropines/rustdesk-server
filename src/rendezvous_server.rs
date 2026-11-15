@@ -650,6 +650,12 @@ fn relay_granted(ip: IpAddr, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Logged when MUST_LOGIN is switched on without a JWT key: check_login cannot verify a
+/// token then, so any non-empty one passes (kept as is for setups that rely on it).
+const UNVERIFIED_LOGIN_WARNING: &str = "MUST_LOGIN is on but RUSTDESK_API_JWT_KEY is empty: \
+     tokens are NOT verified and any non-empty token is accepted. Set RUSTDESK_API_JWT_KEY \
+     to the API server's JWT key.";
+
 /// MUST_LOGIN, for PunchHoleRequest and RequestRelay alike. Err holds the reason for
 /// the log and the message for the client.
 fn check_login(token: &str) -> Result<(), (&'static str, &'static str)> {
@@ -1022,6 +1028,9 @@ impl RendezvousServer {
                     == "Y")
         {
             MUST_LOGIN.store(true, Ordering::SeqCst);
+            if jwt::SECRET.is_empty() {
+                log::warn!("{}", UNVERIFIED_LOGIN_WARNING);
+            }
         }
 
         let tcp_keepalive = get_arg("tcp-keepalive");
@@ -2717,6 +2726,10 @@ impl RendezvousServer {
                 if let Some(rs) = fds.next() {
                     if rs.to_uppercase() == "Y" {
                         MUST_LOGIN.store(true, Ordering::SeqCst);
+                        if jwt::SECRET.is_empty() {
+                            log::warn!("{}", UNVERIFIED_LOGIN_WARNING);
+                            let _ = writeln!(res, "WARNING: {}", UNVERIFIED_LOGIN_WARNING);
+                        }
                     } else {
                         MUST_LOGIN.store(false, Ordering::SeqCst);
                     }
