@@ -124,8 +124,9 @@ upstream. The list is read at start.
 
 ### `TRUSTED_PROXIES`
 
-The WebSocket port (21118) takes the client IP from `X-Real-IP` (else the rightmost
-`X-Forwarded-For` hop that is not a trusted proxy) only when the connection comes from
+The WebSocket port (21118) takes the client IP from the rightmost `X-Forwarded-For` hop that is
+not a trusted proxy (else from `X-Real-IP`, which a proxy may pass through from the
+client when it only appends to `X-Forwarded-For`) only when the connection comes from
 loopback or from an address in `TRUSTED_PROXIES` (IPs or CIDRs, comma separated, e.g.
 `TRUSTED_PROXIES=172.16.0.0/12`). From anyone else the headers are ignored, as are
 loopback, unspecified and unparsable values. Set it when the reverse proxy in front of
@@ -178,7 +179,9 @@ call, and a changed decision applies within 15 s. A call that fails (2 s timeout
 connection error, a status other than 200, a malformed reply) is not cached and by
 default **fails open**: the attempt goes through without permissions, as with
 `AUTHZ_URL` unset. With `AUTHZ_FAIL_CLOSED=Y` (or `--authz-fail-closed Y`) it is refused
-("Authorization service unavailable"). Failures are logged at warn level, at most once
+("Authorization service unavailable"). HTTP 400, 413 and 422 are refused either way
+("Invalid connection request"): they answer the attempt itself, whose fields the controller
+chose, so failing open on them would let a controller skip the decision. Failures are logged at warn level, at most once
 per 30 s; with `RUST_LOG=info,hbbs=debug` every decision is logged.
 
 The secret is read from `AUTHZ_SECRET_FILE` (or `--authz-secret-file`), else

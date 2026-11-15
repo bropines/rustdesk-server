@@ -26,7 +26,8 @@
 //! RequestRelay that follows a failed punch costs nothing. A failed call (2 s timeout,
 //! connection error, non-200, malformed reply) is not cached: the attempt goes through
 //! without permissions, as with the hook off, unless `AUTHZ_FAIL_CLOSED=Y`, which refuses
-//! it. Failures are logged at most every 30 s. Neither the secret nor tokens are ever
+//! it. HTTP 400, 413 and 422 are the exception: they say the service would not read this
+//! attempt (whose fields come from the controller), so it is refused either way. Failures are logged at most every 30 s. Neither the secret nor tokens are ever
 //! logged; the cache keeps a SHA-256 of the token, not the token.
 //!
 //! `AUTHZ_URL` empty (default): no call, nothing changes, as upstream.
@@ -64,6 +65,22 @@ const MAX_REPLY_LEN: usize = 16 * 1024;
 const MAX_REASON_LEN: usize = 256;
 pub(crate) const DENIED: &str = "Access denied by the server policy";
 pub(crate) const UNAVAILABLE: &str = "Authorization service unavailable";
+pub(crate) const INVALID: &str = "Invalid connection request";
+
+// Statuses that answer the request itself (malformed, too large, not processable)
+// rather than say the service is unavailable. The attempt's fields come from the
+// controller, so failing open on these would let a controller skip the decision by
+// sending a field the service refuses to read; they are a refusal instead.
+const REFUSED_STATUSES: [u16; 3] = [400, 413, 422];
+
+/// Why a call gave no decision.
+#[derive(Debug)]
+enum CallError {
+    /// The service could not be asked or did not answer properly: fail open or closed.
+    Unavailable(String),
+    /// The service refused to read this attempt (REFUSED_STATUSES): always a refusal.
+    Refused(u16),
+}
 
 static AUTHZ: OnceCell<Authz> = OnceCell::new();
 
@@ -239,9 +256,13 @@ impl Authz {
                     }
                     (verdict, "service")
                 }
-                Err(why) => {
+                Err(CallError::Unavailable(why)) => {
                     self.log_error(&why);
                     (self.on_error(), "service failed")
+                }
+                Err(CallError::Refused(status)) => {
+                    log::debug!("AUTHZ: service refused to read the attempt (HTTP {})", status);
+                    (Verdict::Deny(INVALID.to_owned()), "service refused the request")
                 }
             },
         };
@@ -274,7 +295,7 @@ impl Authz {
         }
     }
 
-    async fn call(&self, attempt: &Attempt<'_>) -> Result<Verdict, String> {
+    async fn call(&self, attempt: &Attempt<'_>) -> Result<Verdict, CallError> {
         let body = serde_json::json!({
             "target_id": attempt.target_id,
             "token": attempt.token,
@@ -287,22 +308,27 @@ impl Authz {
             request = request.bearer_auth(&self.secret);
         }
         let call = async {
-            let mut response = request.send().await.map_err(describe)?;
-            if response.status() != reqwest::StatusCode::OK {
-                return Err(format!("HTTP status {}", response.status().as_u16()));
+            let unavailable = |e| CallError::Unavailable(describe(e));
+            let mut response = request.send().await.map_err(unavailable)?;
+            let status = response.status().as_u16();
+            if REFUSED_STATUSES.contains(&status) {
+                return Err(CallError::Refused(status));
+            }
+            if status != 200 {
+                return Err(CallError::Unavailable(format!("HTTP status {}", status)));
             }
             let mut reply = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(describe)? {
+            while let Some(chunk) = response.chunk().await.map_err(unavailable)? {
                 if reply.len() + chunk.len() > MAX_REPLY_LEN {
-                    return Err("reply too large".to_owned());
+                    return Err(CallError::Unavailable("reply too large".to_owned()));
                 }
                 reply.extend_from_slice(&chunk);
             }
-            parse_reply(&reply)
+            parse_reply(&reply).map_err(CallError::Unavailable)
         };
         timeout(CALL_TIMEOUT_MS, call)
             .await
-            .map_err(|_| "timeout".to_owned())?
+            .map_err(|_| CallError::Unavailable("timeout".to_owned()))?
     }
 
     fn log_error(&self, why: &str) {
@@ -711,6 +737,24 @@ mod tests {
                 "kind": "punch_hole",
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_the_service_refuses_to_read_is_refused_even_failing_open() {
+        // e.g. the panel's 413 for an oversized token: failing open here would let the
+        // controller skip the decision by choosing the token.
+        for status in REFUSED_STATUSES {
+            let (url, seen) = stub(status, r#"{"error":"too_large"}"#).await;
+            let open = Authz::new(&url, String::new(), false).unwrap();
+            let a = attempt("tok", 0);
+            assert_eq!(open.check(&a).await, Verdict::Deny(INVALID.to_owned()), "{status}");
+            assert_eq!(open.check(&a).await, Verdict::Deny(INVALID.to_owned()), "{status}");
+            assert_eq!(seen.lock().unwrap().len(), 2, "{status}: a refusal was cached");
+        }
+        // a misconfigured service (wrong secret answers 404) still counts as unavailable
+        let (url, _) = stub(404, "").await;
+        let open = Authz::new(&url, String::new(), false).unwrap();
+        assert_eq!(open.check(&attempt("tok", 0)).await, Verdict::Allow(0));
     }
 
     #[tokio::test]

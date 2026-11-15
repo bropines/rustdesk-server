@@ -240,7 +240,7 @@ fn forwarded_for_client(value: &str, trusted: &[IpNetwork]) -> Option<IpAddr> {
 
 /// The address hbbs uses for a WebSocket client.
 ///
-/// X-Real-IP (else X-Forwarded-For) is honoured only when the TCP peer is a trusted
+/// X-Forwarded-For (else X-Real-IP) is honoured only when the TCP peer is a trusted
 /// reverse proxy; a missing, unparsable, loopback or unspecified value falls back to the
 /// TCP peer address. Upstream trusts the headers from anyone, which lets a client that
 /// reaches the port directly claim any IP (IP blocker, intranet detection, logs).
@@ -258,9 +258,13 @@ fn ws_client_addr(
     if !is_trusted_proxy(peer.ip(), trusted) {
         return peer;
     }
+    // X-Forwarded-For first: every proxy appends to it, and the rightmost hop that is not
+    // a trusted proxy is the client whatever it sent. X-Real-IP only when there is no
+    // X-Forwarded-For: a proxy that sets the latter but passes X-Real-IP through untouched
+    // (Caddy, HAProxy) would otherwise let the client pick its own address.
     let ip = match (real_ip, forwarded_for) {
-        (Some(v), _) => parse_header_ip(v).and_then(usable_client_ip),
-        (None, Some(v)) => forwarded_for_client(v, trusted),
+        (_, Some(v)) => forwarded_for_client(v, trusted),
+        (Some(v), None) => parse_header_ip(v).and_then(usable_client_ip),
         (None, None) => None,
     };
     match ip {
@@ -631,7 +635,12 @@ fn grant_relay(ip: IpAddr, id: &str) {
         if grants.len() >= RELAY_GRANTS_MAX {
             grants.retain(|_, t| t.elapsed().as_millis() < RELAY_GRANT_TTL_MS);
             if grants.len() >= RELAY_GRANTS_MAX {
-                return;
+                // Still full of live grants: drop the oldest tenth rather than refuse new
+                // ones, so a flood of grants cannot break relay fallback for everyone.
+                let mut times: Vec<Instant> = grants.values().copied().collect();
+                times.sort_unstable();
+                let cutoff = times[times.len() / 10];
+                grants.retain(|_, t| *t > cutoff);
             }
         }
         grants.insert((unmap_ip(ip), id.to_owned()), Instant::now());
@@ -1996,6 +2005,17 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        // The same bounds RequestRelay has (relay_request_fields_ok). Checked before
+        // MUST_LOGIN and the authorization service, which get these fields.
+        if ph.id.is_empty() || ph.id.len() > MAX_PEER_ID_LEN || ph.token.len() > MAX_TOKEN_LEN {
+            log::warn!("Punch hole request from {} refused: missing or oversized fields", addr);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: authz::INVALID.to_owned(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
@@ -3425,12 +3445,14 @@ mod tests {
         for bad in ["127.0.0.1", "::1", "0.0.0.0", "::", "", "unknown", "1.2.3.4, 5.6.7.8"] {
             assert_eq!(ws_client_addr(lo, Some(bad), None, &none), lo, "{bad:?}");
         }
-        // X-Real-IP wins over X-Forwarded-For, even when it is unusable
+        // X-Forwarded-For wins over X-Real-IP: a proxy that appends to the former may
+        // pass a client's own X-Real-IP through
         assert_eq!(
             ws_client_addr(lo, Some("9.9.9.9"), Some("8.8.8.8"), &none),
-            sa("9.9.9.9:40000")
+            sa("8.8.8.8:40000")
         );
-        assert_eq!(ws_client_addr(lo, Some("bogus"), Some("8.8.8.8"), &none), lo);
+        assert_eq!(ws_client_addr(lo, Some("bogus"), Some("8.8.8.8"), &none), sa("8.8.8.8:40000"));
+        assert_eq!(ws_client_addr(lo, Some("9.9.9.9"), Some("bogus"), &none), lo);
         // X-Forwarded-For: the rightmost hop that is not a trusted proxy
         assert_eq!(
             ws_client_addr(lo, None, Some("6.6.6.6, 8.8.8.8"), &none),
