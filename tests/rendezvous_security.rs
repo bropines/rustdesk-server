@@ -200,7 +200,7 @@ async fn ws_connect(h: &Hbbs, local_ip: &str) -> Ws {
 }
 
 async fn ws_send(ws: &mut Ws, msg: &RendezvousMessage) {
-    ws.send(WsMessage::Binary(msg.write_to_bytes().unwrap()))
+    ws.send(WsMessage::Binary(msg.write_to_bytes().unwrap().into()))
         .await
         .unwrap();
 }
@@ -214,7 +214,7 @@ async fn ws_next_frame(ws: &mut Ws, ms: u64) -> Option<Vec<u8>> {
             return None;
         }
         match tokio::time::timeout(left, ws.next()).await {
-            Ok(Some(Ok(WsMessage::Binary(b)))) => return Some(b),
+            Ok(Some(Ok(WsMessage::Binary(b)))) => return Some(b.to_vec()),
             Ok(Some(Ok(_))) => continue,
             _ => return None,
         }

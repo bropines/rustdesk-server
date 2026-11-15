@@ -188,7 +188,7 @@ async fn ws_connect(h: &Hbbs, local_ip: &str) -> Ws {
 }
 
 async fn ws_send(ws: &mut Ws, msg: &RendezvousMessage) {
-    ws.send(WsMessage::Binary(msg.write_to_bytes().unwrap()))
+    ws.send(WsMessage::Binary(msg.write_to_bytes().unwrap().into()))
         .await
         .unwrap();
 }
