@@ -72,8 +72,8 @@ enum SinkOut {
     // A serialized message (encrypted by the writer once a key is set); an empty one is
     // the rendezvous keepalive, which TCP/WebSocket clients echo.
     Frame(Vec<u8>),
-    // Encrypt the frames queued after this one.
-    Key(Key),
+    // Encrypt the frames queued after this one (only its sending half is used here).
+    Cipher(Encrypt),
 }
 
 /// Sending half of a TCP/WebSocket rendezvous connection.
@@ -114,8 +114,8 @@ impl Sink {
             let mut encrypt: Option<Encrypt> = None;
             while let Some(out) = rx.recv().await {
                 let mut bytes = match out {
-                    SinkOut::Key(key) => {
-                        encrypt = Some(Encrypt::new(key));
+                    SinkOut::Cipher(cipher) => {
+                        encrypt = Some(cipher);
                         continue;
                     }
                     SinkOut::Frame(bytes) => bytes,
@@ -160,7 +160,11 @@ impl Sink {
     }
 
     fn set_key(&self, key: Key) -> bool {
-        self.tx.try_send(SinkOut::Key(key)).is_ok()
+        self.set_cipher(Encrypt::new(key))
+    }
+
+    fn set_cipher(&self, cipher: Encrypt) -> bool {
+        self.tx.try_send(SinkOut::Cipher(cipher)).is_ok()
     }
 
     /// Resolves once the writer task has stopped (write error or stalled client).
@@ -296,6 +300,9 @@ struct StreamConn {
     rx_key: Option<Encrypt>,
     // The id this connection registered with an accepted (uuid-checked) RegisterPk.
     reg_id: Option<String>,
+    // The key exchange version hbbs advertised on this connection: 0 unless
+    // KEY_EXCHANGE_V1 and the signed KeyExchange went out here.
+    kx_advertised: u32,
 }
 
 impl StreamConn {
@@ -305,6 +312,7 @@ impl StreamConn {
             sink,
             rx_key: None,
             reg_id: None,
+            kx_advertised: 0,
         }
     }
 }
@@ -323,6 +331,12 @@ static TCP_KEEPALIVE: AtomicBool = AtomicBool::new(false);
 // KeyExchange gets an encrypted connection as over TCP. Off by default: upstream
 // sends it on TCP only.
 static WS_KEY_EXCHANGE: AtomicBool = AtomicBool::new(false);
+// Opt-in: advertise key exchange version 1 (KEY_EXCHANGE_V1) in the KeyExchange hbbs sends:
+// signed parameters, and one stream key per direction bound to the handshake. Off by
+// default: the exchange is then version 0, byte for byte as before.
+static KEY_EXCHANGE_V1: AtomicBool = AtomicBool::new(false);
+// The only version above 0 this server speaks; independent of what hbb_common's latest is.
+const KX_V1: u32 = 1;
 // Opt-in: forward RequestRelay to a peer registered over WebSocket on that connection.
 // Off by default: RequestRelay goes over UDP to the peer's address, as upstream.
 static WS_PEERS: AtomicBool = AtomicBool::new(false);
@@ -1042,6 +1056,13 @@ impl RendezvousServer {
             "WS_KEY_EXCHANGE={}",
             if WS_KEY_EXCHANGE.load(Ordering::SeqCst) { "Y" } else { "N" }
         );
+        if get_arg("key-exchange-v1").to_uppercase() == "Y" {
+            KEY_EXCHANGE_V1.store(true, Ordering::SeqCst);
+        }
+        log::info!(
+            "KEY_EXCHANGE_V1={}",
+            if KEY_EXCHANGE_V1.load(Ordering::SeqCst) { "Y" } else { "N" }
+        );
         log::info!(
             "WS_PEERS={}",
             if WS_PEERS.load(Ordering::SeqCst) { "Y" } else { "N" }
@@ -1594,8 +1615,46 @@ impl RendezvousServer {
                         return false;
                     };
                     log::debug!("KeyExchange with {:?}: symmetric key derived", addr);
+                    // The version the client picked. Without KEY_EXCHANGE_V1 nothing above 0
+                    // was advertised and the field is not looked at, as before. With it, the
+                    // client may pick 0 (a client from before versions) or 1; anything
+                    // above what this connection was offered is refused.
+                    let advertised = conn.kx_advertised;
+                    let picked = if advertised == 0 { 0 } else { ex.version };
+                    if picked > advertised {
+                        log::warn!(
+                            "Handshake failed from {}: key exchange version {} was not offered (offered {})",
+                            addr,
+                            ex.version,
+                            advertised
+                        );
+                        return false;
+                    }
                     let key = secretbox::Key::from_slice(&symetric_key);
                     match key {
+                        Some(key) if picked >= KX_V1 => {
+                            // One key per direction, bound to both public keys and the
+                            // advertised and picked versions, as the 1.5.x client derives it:
+                            // `new_split` gives the responder (this side) the responder
+                            // subkey to send under and the initiator one to receive under.
+                            let server_pk = kx_v1_pk(&self.inner.secure_tcp_pk_b);
+                            let transcript = tcp::KxTranscript {
+                                initiator_pk: &their_pk,
+                                responder_pk: &server_pk,
+                                advertised,
+                                picked,
+                            };
+                            let Ok(cipher) = Encrypt::new_split(key, false, &transcript) else {
+                                log::warn!("Handshake failed from {}: key derivation", addr);
+                                return false;
+                            };
+                            if !conn.sink.set_cipher(cipher.clone()) {
+                                return false;
+                            }
+                            conn.rx_key = Some(cipher);
+                            log::debug!("KeyExchange v{} symetric keys set", picked);
+                            return true;
+                        }
                         Some(key) => {
                             // the writer task encrypts what is queued from now on
                             if !conn.sink.set_key(key.clone()) {
@@ -2768,7 +2827,7 @@ impl RendezvousServer {
             conn = StreamConn::new(Sink::ws(a, addr));
             sink = Some(conn.sink.clone());
             if !key.is_empty() && WS_KEY_EXCHANGE.load(Ordering::SeqCst) {
-                self.key_exchange_phase1(addr, &mut sink).await;
+                conn.kx_advertised = self.key_exchange_phase1(addr, &mut sink).await;
             }
             // ends the connection once its writer task stopped
             let writer = conn.sink.clone();
@@ -2817,7 +2876,7 @@ impl RendezvousServer {
             let writer = conn.sink.clone();
             // Avoid key exchange if answering on nat helper port
             if !key.is_empty() {
-                self.key_exchange_phase1(addr, &mut sink).await;
+                conn.kx_advertised = self.key_exchange_phase1(addr, &mut sink).await;
             }
             let mut keepalive = interval(Duration::from_millis(TCP_KEEPALIVE_MS));
             let idle = tokio::time::sleep(Duration::from_millis(TCP_IDLE_TIMEOUT_MS));
@@ -2959,29 +3018,68 @@ impl RendezvousServer {
         false
     }
 
-    async fn key_exchange_phase1(&mut self, addr: SocketAddr, sink: &mut Option<Sink>) {
+    /// Sends the signed KeyExchange; returns the key exchange version it advertised
+    /// (0 when nothing was sent, or when KEY_EXCHANGE_V1 is off).
+    async fn key_exchange_phase1(&mut self, addr: SocketAddr, sink: &mut Option<Sink>) -> u32 {
         let mut msg_out = RendezvousMessage::new();
         log::debug!("KeyExchange phase 1: send our pk for this tcp connection in a message signed with our server key");
         let sk = &self.inner.sk;
         match sk {
             Some(sk) => {
+                let v1 = KEY_EXCHANGE_V1.load(Ordering::SeqCst);
                 let our_pk_b = self.inner.secure_tcp_pk_b.clone();
-                let sm = sign::sign(&our_pk_b.0, &sk);
-
-                let bytes_sm = Bytes::from(sm);
-                msg_out.set_key_exchange(KeyExchange {
-                    keys: vec![bytes_sm],
-                    ..Default::default()
-                });
+                msg_out.set_key_exchange(key_exchange_offer(&our_pk_b, sk, v1));
                 log::trace!(
                     "KeyExchange {:?} -> bytes: {:?}",
                     addr,
                     hex::encode(Bytes::from(msg_out.write_to_bytes().unwrap()))
                 );
                 Self::send_to_sink(sink, msg_out).await;
+                if v1 {
+                    KX_V1
+                } else {
+                    0
+                }
             }
-            None => {}
+            None => 0,
         }
+    }
+}
+
+/// The server's public key as advertised at version 1: X25519 ignores bit 255 of a public key,
+/// and genuine keys never have it set, so setting it marks the signed-parameters form for
+/// clients that know it, while older clients use the key unchanged. The transcript and the
+/// signed parameters carry these bytes, as signed.
+fn kx_v1_pk(pk: &PublicKey) -> [u8; 32] {
+    let mut pk = pk.0;
+    pk[31] |= 0x80;
+    pk
+}
+
+/// The KeyExchange hbbs sends right after accept: `keys[0]` is the public key signed with the
+/// server key. At version 1 it also carries the version and `signed_params`, the server's
+/// signature over `KX_PARAMS_DOMAIN || KxParams { pk, version }`, so a client can tell the
+/// version was not tampered with (rustdesk/rustdesk#16326).
+fn key_exchange_offer(pk: &PublicKey, sk: &sign::SecretKey, v1: bool) -> KeyExchange {
+    if !v1 {
+        return KeyExchange {
+            keys: vec![Bytes::from(sign::sign(&pk.0, sk))],
+            ..Default::default()
+        };
+    }
+    let pk = kx_v1_pk(pk);
+    let params = KxParams {
+        pk: Bytes::from(pk.to_vec()),
+        version: KX_V1,
+        ..Default::default()
+    };
+    let mut payload = tcp::KX_PARAMS_DOMAIN.to_vec();
+    payload.extend_from_slice(&params.write_to_bytes().unwrap_or_default());
+    KeyExchange {
+        keys: vec![Bytes::from(sign::sign(&pk, sk))],
+        version: KX_V1,
+        signed_params: Bytes::from(sign::sign(&payload, sk)),
+        ..Default::default()
     }
 }
 

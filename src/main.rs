@@ -30,6 +30,7 @@ fn main() -> ResultType<()> {
         , --ws-relay-servers=[HOSTS] 'Relays offered to WebSocket (browser) clients instead of the relay servers, separated by comma'
         , --ws-peers=[Y|N] 'Forward RequestRelay to peers registered over WebSocket (default: UDP only, as upstream)'
         , --ws-key-exchange=[Y|N] 'Also send the signed key exchange on WebSocket connections, so browser clients can check the server key (default: TCP only, as upstream)'
+        , --key-exchange-v1=[Y|N] 'Advertise key exchange version 1 (signed parameters, one key per direction) in the KeyExchange, for RustDesk >= 1.5.0 clients (default: version 0, as before)'
         , --trusted-proxies=[CIDRS] 'Reverse proxies (IPs/CIDRs, comma separated) whose X-Real-IP/X-Forwarded-For the WebSocket port honours, besides loopback'
         , --authz-url=[URL] 'Ask this HTTP endpoint before forwarding each connection attempt to a peer (default: off, as upstream)'
         , --authz-secret=[SECRET] 'Bearer secret for --authz-url (prefer AUTHZ_SECRET or --authz-secret-file)'

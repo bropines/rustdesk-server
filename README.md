@@ -21,6 +21,7 @@ Default branch: **`rdpanel`**. RD Panel's container image pins a commit of this 
 | WebRTC signaling for RustDesk ≥ 1.5.0 (SDP offer/answer, trickle ICE) | `WEBRTC=Y` (or `--webrtc Y`, admin command `webrtc Y\|N`) | this fork |
 | Forward `RequestRelay` to peers registered over WebSocket | `WS_PEERS=Y` (or `--ws-peers Y`, admin command `ws-peers Y\|N`) | this fork |
 | Prove the server key on WebSocket connections too (signed `KeyExchange`, as on TCP) | `WS_KEY_EXCHANGE=Y` (or `--ws-key-exchange Y`) | this fork |
+| Key exchange version 1 for RustDesk ≥ 1.5.0 (signed parameters, one key per direction, downgrade protection) | `KEY_EXCHANGE_V1=Y` (or `--key-exchange-v1 Y`) | this fork |
 | Separate relays for WebSocket (browser) clients | `WS_RELAY_SERVERS=<host:port,...>` (or `--ws-relay-servers`) | this fork |
 | Relay selection by client IP prefix | a `relay_map.txt` file next to hbbs (admin command `reload-geo`) | this fork |
 | Real client IPs behind a reverse proxy on another host (WebSocket port) | `TRUSTED_PROXIES=<IPs/CIDRs>` (or `--trusted-proxies`) | this fork |
@@ -91,6 +92,23 @@ cannot check the key before connecting to a device. With `WS_KEY_EXCHANGE=Y` hbb
 sends it on WebSocket connections too; a client may ignore it (the connection stays
 unencrypted, as before) or answer with its own `KeyExchange`, after which both
 directions are encrypted exactly as on TCP. Off by default.
+
+### `KEY_EXCHANGE_V1`
+
+The `KeyExchange` that hbbs sends on TCP (and on WebSocket with `WS_KEY_EXCHANGE=Y`) is
+the original, version 0 scheme: one key for both directions. RustDesk 1.5.0 added
+version 1: the server signs its parameters (the key and the version it advertises), the
+client says which version it picked, and each direction gets its own key, derived from
+a transcript that binds both public keys and the advertised and picked versions, so a
+middlebox cannot downgrade the exchange or have the two sides disagree unnoticed
+([rustdesk/rustdesk#16326](https://github.com/rustdesk/rustdesk/pull/16326)). With
+`KEY_EXCHANGE_V1=Y` hbbs advertises version 1 on the connections where it already sends
+the exchange, and accepts a client that picks version 1 (RustDesk ≥ 1.5.0) or version
+0. Clients from before versions (1.4.x and older) ignore the extra fields, use the key
+as before and answer version 0, so they keep working unchanged; a pick above what was
+offered is refused and closes the connection. Off by default: the exchange is then
+version 0, byte for byte as before, and the client's version field is not looked at.
+Browser clients (WebSocket) are only offered it with `WS_KEY_EXCHANGE=Y` as well.
 
 ### `WS_RELAY_SERVERS`
 
